@@ -6,6 +6,7 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"io"
+	"log"
 	"math"
 	"math/big"
 	"math/rand"
@@ -46,11 +47,15 @@ type ServerID string
 type ServerAddress string
 
 type Raft struct {
-	currentTerm uint64
-	commitIndex uint64
-	lastApplied uint64
+	currentTerm uint64	// 当前的Term，持久化存储
+	commitIndex uint64	// 当前commit的index(leader的commit index总是领先于follower)
+	lastApplied uint64	// 最后被应用到FSM的index
 
 	lastLock     sync.Mutex
+	/*
+	1. 启动时从本地日恢复最后日志，设置下面两个字段
+	2. follower从leader收到检查并处理后，也设置下面两个字段
+	*/
 	lastLogIndex uint64
 	lastLogTerm  uint64
 
@@ -62,24 +67,31 @@ type Raft struct {
 
 	logger hclog.Logger
 
+	/*
+	1. logs: 存储和读取日志
+	2. stable: 存储一些需要持久化的字段，如currentTerm
+	*/
 	logs   raft.LogStore
 	stable raft.StableStore
 
+	// 当前的Leader
 	leader     ServerAddress
 	leaderLock sync.RWMutex
 
+	// 作为follower指示leader最后和自己联系的时间
 	lastContact     time.Time
 	lastContactLock sync.RWMutex
 
+	// 用于关闭Raft的channel和锁
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 
-	rpcCh   <-chan RPC
-	applyCh chan *LogFuture
-	fsm     FSM
+	rpcCh   <-chan RPC	// 从transport接收RPC请求并处理
+	applyCh chan *LogFuture	// 调用ApplyLog把日志发送给Leader处理
+	fsm     FSM	// 状态机，日志commit之后调用状态机的Apply处理
 
-	config *Config
+	config *Config	// 配置参数
 
 	routinesGroup sync.WaitGroup
 	state         uint32
@@ -270,7 +282,7 @@ type RequestVoteRPCRequest struct {
 	lastLogTerm  uint64
 }
 
-type RequestVoteRPCReponse struct {
+type RequestVoteRPCResponse struct {
 	term        uint64
 	voteGranted bool
 }
@@ -391,6 +403,7 @@ func (r *Raft) runFSM() {
 }
 
 func (r *Raft) runFollower() {
+	fmt.Println("we are in follower...")
 	heartbeatTimer := randomTimeout(r.config.HeartbeatTimeout)
 	for r.GetState() == Follower {
 		select {
@@ -578,9 +591,9 @@ func (r *Raft) processHeartbeat(rcp RPC) {
 }
 
 func (r *Raft) runCandidate() {
-
+	log.Println("we are in candidate...")
 }
 
 func (r *Raft) runLeader() {
-
+	log.Panicln("we are in leader...")
 }

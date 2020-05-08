@@ -67,7 +67,7 @@ type Transport interface {
 	AppendEntries(id string, target ServerAddress, args *AppendEntriesRPCRequest, resp *AppendEntriesRPCResponse) error
 
 	// RequestVote sends the appropriate RPC to the target node.
-	RequestVote(id string, target ServerAddress, args *RequestVoteRPCRequest, resp *RequestVoteRPCReponse) error
+	RequestVote(id string, target ServerAddress, args *RequestVoteRPCRequest, resp *RequestVoteRPCResponse) error
 
 	// SetHeartbeatHandler is used to setup a heartbeat handler
 	// as a fast-pass. This is to avoid head-of-line blocking from
@@ -258,7 +258,7 @@ func (trans *TCPTransport) AppendEntries(id string, target ServerAddress, args *
 }
 
 func (trans *TCPTransport) RequestVote(id string, target ServerAddress, args *RequestVoteRPCRequest,
-	resp *RequestVoteRPCReponse) error {
+	resp *RequestVoteRPCResponse) error {
 
 	connCoding, err := trans.getConnCoding(target)
 

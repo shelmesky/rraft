@@ -666,9 +666,9 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 	// 所以就再投一次票。
 	// 但如果只是term相同，就说明已经为其他candidate投票，不能再次投票
 	if lastVoteTerm == req.term && lastVoteCandidateBytes != nil {
-		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
+		r.logger.Info("duplicate requestVote for same term", "term", req.term)
 		if bytes.Compare(lastVoteCandidateBytes, []byte(req.candidateID)) == 0 {
-			r.logger.Warn("duplicate requestVote from", "candidate", req.Candidate)
+			r.logger.Warn("duplicate requestVote from", "candidate", req.candidateID)
 			resp.voteGranted = true
 		}
 		return

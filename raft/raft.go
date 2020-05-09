@@ -754,6 +754,7 @@ type voteResult struct {
 func (r *Raft) electSelf() <-chan *voteResult {
 	respCh := make(chan *voteResult, len(r.configurations.Server))
 
+	// 当前term+1，开始选举流程
 	r.SetCurrentTerm(r.GetCurrentTerm() + 1)
 
 	lastIdx, lastTerm := r.GetLastLog()
@@ -764,6 +765,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 		lastLogTerm:  lastTerm,
 	}
 
+	// askPeer将投票请求发送到其他节点，并将响应发送到channel中
 	askPeer := func(peer Server) {
 		r.goFunc(func() {
 			resp := &voteResult{voterID: peer.ID}
@@ -781,11 +783,12 @@ func (r *Raft) electSelf() <-chan *voteResult {
 		})
 	}
 
+	// 循环处理所有节点并发送投票请求
 	for _, server := range r.configurations.Server {
 		if server.Suffrage == Voter {
 			// 为自身投票并持久化
 			if server.ID == r.localID {
-
+				// 模拟收到投票请求并持久化
 				err := r.persistVote(req.term, req.candidateID)
 				if err != nil {
 					r.logger.Error("failed to persist vote", "error", err)

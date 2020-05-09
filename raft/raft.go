@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	crand "crypto/rand"
 	"fmt"
 	hclog "github.com/hashicorp/go-hclog"
@@ -46,15 +47,35 @@ func min(a, b uint64) uint64 {
 type ServerID string
 type ServerAddress string
 
-type Raft struct {
-	currentTerm uint64	// 当前的Term，持久化存储
-	commitIndex uint64	// 当前commit的index(leader的commit index总是领先于follower)
-	lastApplied uint64	// 最后被应用到FSM的index
+type ServerSuffrage int
 
-	lastLock     sync.Mutex
+const (
+	Voter ServerSuffrage = iota
+	Nonvoter
+	Staging
+)
+
+type Server struct {
+	Suffrage ServerSuffrage
+	ID       ServerID
+	Address  ServerAddress
+}
+
+type Configuration struct {
+	Server []Server
+}
+
+type Raft struct {
+	currentTerm uint64 // 当前的Term，持久化存储
+	commitIndex uint64 // 当前commit的index(leader的commit index总是领先于follower)
+	lastApplied uint64 // 最后被应用到FSM的index
+
+	configurations Configuration
+
+	lastLock sync.Mutex
 	/*
-	1. 启动时从本地日恢复最后日志，设置下面两个字段
-	2. follower从leader收到检查并处理后，也设置下面两个字段
+		1. 启动时从本地日恢复最后日志，设置下面两个字段
+		2. follower从leader收到检查并处理后，也设置下面两个字段
 	*/
 	lastLogIndex uint64
 	lastLogTerm  uint64
@@ -68,8 +89,8 @@ type Raft struct {
 	logger hclog.Logger
 
 	/*
-	1. logs: 存储和读取日志
-	2. stable: 存储一些需要持久化的字段，如currentTerm
+		1. logs: 存储和读取日志
+		2. stable: 存储一些需要持久化的字段，如currentTerm
 	*/
 	logs   raft.LogStore
 	stable raft.StableStore
@@ -82,16 +103,20 @@ type Raft struct {
 	lastContact     time.Time
 	lastContactLock sync.RWMutex
 
+	trans Transport
+
 	// 用于关闭Raft的channel和锁
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 
-	rpcCh   <-chan RPC	// 从transport接收RPC请求并处理
-	applyCh chan *LogFuture	// 调用ApplyLog把日志发送给Leader处理
-	fsm     FSM	// 状态机，日志commit之后调用状态机的Apply处理
+	rpcCh   <-chan RPC      // 从transport接收RPC请求并处理
+	applyCh chan *LogFuture // 调用ApplyLog把日志发送给Leader处理
 
-	config *Config	// 配置参数
+	fsm         FSM              // 状态机，日志commit之后调用状态机的Apply处理
+	fsmMutateCh chan interface{} // 将日志发送到FSM处理
+
+	config *Config // 配置参数
 
 	routinesGroup sync.WaitGroup
 	state         uint32
@@ -112,6 +137,10 @@ func (r *Raft) GetCurrentTerm() uint64 {
 }
 
 func (r *Raft) SetCurrentTerm(term uint64) {
+	err := r.stable.SetUint64(KeyCurrentTerm, term)
+	if err != nil {
+		panic(fmt.Errorf("failed to save current term: %v", err))
+	}
 	atomic.StoreUint64(&r.currentTerm, term)
 }
 
@@ -254,7 +283,7 @@ type StableStore interface {
 }
 
 type FSM interface {
-	Apply(*Log) interface{}
+	Apply(*raft.Log) interface{}
 }
 
 // AE请求
@@ -331,6 +360,8 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 		stable:    stable,
 		applyCh:   make(chan *LogFuture),
 		config:    config,
+		fsm:       fsm,
+		trans:     trans,
 	}
 
 	r.rpcCh = trans.Consumer()
@@ -399,11 +430,23 @@ func randomTimeout(minVal time.Duration) <-chan time.Time {
 }
 
 func (r *Raft) runFSM() {
-
+	for {
+		select {
+		case ptr := <-r.fsmMutateCh:
+			switch req := ptr.(type) {
+			case *raft.Log:
+				r.fsm.Apply(req)
+			default:
+				panic(fmt.Errorf("bad type passed to fsmMutateCh: %#v", ptr))
+			}
+		case <-r.shutdownCh:
+			return
+		}
+	}
 }
 
 func (r *Raft) runFollower() {
-	fmt.Println("we are in follower...")
+	r.logger.Info("entering follower state", "follower", r, "leader", r.Leader())
 	heartbeatTimer := randomTimeout(r.config.HeartbeatTimeout)
 	for r.GetState() == Follower {
 		select {
@@ -436,7 +479,7 @@ func (r *Raft) processRPC(rpc RPC) {
 	case *AppendEntriesRPCRequest:
 		r.appendEntries(rpc, cmd)
 	case *RequestVoteRPCRequest:
-		r.rquestVote(rpc, cmd)
+		r.requestVote(rpc, cmd)
 	default:
 		r.logger.Error("got unexpected command",
 			"command", hclog.Fmt("%#v", rpc.Command))
@@ -570,12 +613,117 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 	}
 }
 
-func (r *Raft) rquestVote(rpc RPC, req *RequestVoteRPCRequest) {
+func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
+	// 初始化一个投票响应
+	resp := &RequestVoteRPCResponse{
+		term:        r.GetCurrentTerm(),
+		voteGranted: false,
+	}
 
+	var rpcErr error
+	defer func() {
+		rpc.Respond(resp, rpcErr)
+	}()
+
+	candidateID := req.candidateID
+	leader := r.Leader()
+	// 如果当前存在leader并且leader不是本机
+	if leader != "" && leader != ServerAddress(candidateID) {
+		r.logger.Warn("rejecting vote request since we have a leader",
+			"from", candidateID,
+			"leader", leader)
+		return
+	}
+
+	// 如果投票请求的term小于本机，则拒绝投票
+	if req.term < r.GetCurrentTerm() {
+		return
+	}
+
+	// 如果请求的term大于本机，说明有新leader，则从candidate进入follower状态
+	// 并设置term
+	if req.term > r.GetCurrentTerm() {
+		r.logger.Debug("lost leadership because received a requestVote with a newer term")
+		r.SetState(Follower)
+		r.SetCurrentTerm(req.term)
+		resp.term = req.term
+	}
+
+	// 从磁盘获取最后投票的term和candidate信息
+	lastVoteTerm, err := r.stable.GetUint64(KeyLastVoteTerm)
+	if err != nil {
+		r.logger.Error("failed to get last vote term", "error", err)
+		return
+	}
+	lastVoteCandidateBytes, err := r.stable.Get(KeyLastVoteCand)
+	if err != nil && err.Error() != "not found" {
+		r.logger.Error("failed to get last vote candidate", "error", err)
+		return
+	}
+
+	// 如果保存在磁盘上的最近投票term和Candidate都不为空。
+	// 如果candidate信息和请求中的一样，说明已经为这个candidate投了一票，但它没有收到投票结果
+	// 所以就再投一次票。
+	// 但如果只是term相同，就说明已经为其他candidate投票，不能再次投票
+	if lastVoteTerm == req.term && lastVoteCandidateBytes != nil {
+		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
+		if bytes.Compare(lastVoteCandidateBytes, []byte(req.candidateID)) == 0 {
+			r.logger.Warn("duplicate requestVote from", "candidate", req.Candidate)
+			resp.voteGranted = true
+		}
+		return
+	}
+
+	// 如果请求的term小于本地term则拒绝投赞成票。
+	// 如果请求的term等于本地term，但请求的index小于本地的也拒绝投赞成票。
+	lastIdx, lastTerm := r.GetLastLog()
+	if lastTerm > req.lastLogTerm {
+		r.logger.Warn("rejecting vote request since our last term is greater",
+			"candidate", candidateID,
+			"last-term", lastTerm,
+			"last-candidate-term", req.lastLogTerm)
+		return
+	}
+	if lastTerm == req.lastLogTerm && lastIdx > req.lastLogIndex {
+		r.logger.Warn("rejecting vote request since our last index is greater",
+			"candidate", candidateID,
+			"last-index", lastIdx,
+			"last-candidate-index", req.lastLogIndex)
+		return
+	}
+
+	// 投票之前将term和candidate信息持久化（不能重复投票）
+	err = r.persistVote(req.term, req.candidateID)
+	if err != nil {
+		r.logger.Error("failed to persist vote", "error", err)
+		return
+	}
+
+	// 投赞成票
+	resp.voteGranted = true
+	r.SetLastContact()
+	return
 }
 
 // 将日志应用到FSM
 func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
+	lastApplied := r.GetLastApplied()
+
+	if index <= lastApplied {
+		r.logger.Warn("skipping application of old log", "index", index)
+		return
+	}
+
+	for idx := lastApplied + 1; idx <= index; idx++ {
+		l := new(raft.Log)
+		err := r.logs.GetLog(idx, l)
+		if err != nil {
+			r.logger.Error("failed to get log", "index", idx, "error", err)
+			panic(err)
+		}
+
+		r.fsmMutateCh <- l
+	}
 
 }
 
@@ -590,8 +738,139 @@ func (r *Raft) processHeartbeat(rcp RPC) {
 
 }
 
+// 法定人数的数量是超过半数的节点
+func (r *Raft) quorumSize() int {
+	voters := len(r.configurations.Server)
+	return voters/2 + 1
+}
+
+type voteResult struct {
+	RequestVoteRPCResponse
+	voterID ServerID
+}
+
+// candidate给自身投票，并向集群内的其他节点投票
+// 返回一个channel，可以获取所有节点的投票结果
+func (r *Raft) electSelf() <-chan *voteResult {
+	respCh := make(chan *voteResult, len(r.configurations.Server))
+
+	r.SetCurrentTerm(r.GetCurrentTerm() + 1)
+
+	lastIdx, lastTerm := r.GetLastLog()
+	req := &RequestVoteRPCRequest{
+		term:         r.GetCurrentTerm(),
+		candidateID:  string(r.localID),
+		lastLogIndex: lastIdx,
+		lastLogTerm:  lastTerm,
+	}
+
+	askPeer := func(peer Server) {
+		r.goFunc(func() {
+			resp := &voteResult{voterID: peer.ID}
+
+			err := r.trans.RequestVote(string(peer.ID), peer.Address, req, &resp.RequestVoteRPCResponse)
+			if err != nil {
+				r.logger.Error("failed to make requestVote RPC",
+					"target", peer,
+					"error", err)
+				resp.term = req.term
+				resp.voteGranted = false
+			}
+
+			respCh <- resp
+		})
+	}
+
+	for _, server := range r.configurations.Server {
+		if server.Suffrage == Voter {
+			// 为自身投票并持久化
+			if server.ID == r.localID {
+
+				err := r.persistVote(req.term, req.candidateID)
+				if err != nil {
+					r.logger.Error("failed to persist vote", "error", err)
+					return nil
+				}
+
+				respCh <- &voteResult{
+					RequestVoteRPCResponse: RequestVoteRPCResponse{
+						term:        req.term,
+						voteGranted: true,
+					},
+					voterID: r.localID,
+				}
+
+			} else {
+				askPeer(server)
+			}
+		}
+	}
+
+	return respCh
+}
+
+func (r *Raft) persistVote(term uint64, candidate string) error {
+	err := r.stable.SetUint64(KeyLastVoteTerm, term)
+	if err != nil {
+		return err
+	}
+
+	err = r.stable.Set(KeyLastVoteCand, []byte(candidate))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (r *Raft) runCandidate() {
-	log.Println("we are in candidate...")
+	r.logger.Info("entering candidate state", "node", r, "term", r.GetCurrentTerm()+1)
+
+	voteCh := r.electSelf()
+
+	electionTimer := randomTimeout(r.config.ElectionTimeout)
+
+	grantedVote := 0
+	votesNeeded := r.quorumSize()
+
+	for r.GetState() == Candidate {
+		select {
+		case rpc := <-r.rpcCh:
+			r.processRPC(rpc)
+
+		case vote := <-voteCh:
+			if vote.term > r.GetCurrentTerm() {
+				// 收到了比自己term高的回应，说明新leader已经选出
+				// 应该进入Follower状态，并设置term为新leader的term
+				r.logger.Debug("newer term discovered, fallback to follower")
+				r.SetState(Follower)
+				r.SetCurrentTerm(vote.term)
+				return
+			}
+
+			// 统计赞成票的数量
+			if vote.voteGranted {
+				grantedVote++
+				r.logger.Debug("vote granted", "from", vote.voterID, "term", vote.term, "tally", grantedVote)
+			}
+
+			// 收到了足够的赞成票，进入Leader状态
+			if grantedVote >= votesNeeded {
+				r.logger.Info("election won", "tally", grantedVote)
+				r.SetState(Leader)
+				r.SetLeader(r.localAddr)
+				return
+			}
+
+		case <-electionTimer:
+			// 选举超时，直接退出函数，外部的循环会继续执行本函数
+			r.logger.Warn("Election timeout reached, restarting election")
+			return
+
+		case <-r.shutdownCh:
+			return
+		}
+	}
 }
 
 func (r *Raft) runLeader() {

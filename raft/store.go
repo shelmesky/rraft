@@ -125,7 +125,7 @@ func (s *KVStore) Set(key, value string) error {
 
 type fsm KVStore
 
-func (f *fsm) Apply(log *Log) interface{} {
+func (f *fsm) Apply(log *raft.Log) interface{} {
 	var c command
 	if err := json.Unmarshal(log.Data, &c); err != nil {
 		panic(fmt.Sprintf("failed to unmarshal command: %s", err.Error()))

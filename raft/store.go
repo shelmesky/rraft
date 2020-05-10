@@ -39,6 +39,7 @@ func NewRaftServer(raftDir, raftBind, httpBind string) *KVStore {
 func (s *KVStore) Open(localID ServerID) error {
 	config := DefaultConfig()
 
+
 	transport, err := NewTCPTransport(localID, s.RaftBind)
 	if err != nil {
 		return err

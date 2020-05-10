@@ -2,16 +2,18 @@ package raft
 
 import (
 	"bytes"
+	"container/list"
 	crand "crypto/rand"
+	"errors"
 	"fmt"
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"io"
-	"log"
 	"math"
 	"math/big"
 	"math/rand"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,12 +25,17 @@ const (
 	LogCommand LogType = iota
 	LogNoop
 	LogConfiguration
+
+	maxFailureScale = 12
+	failureWait     = 10 * time.Millisecond
 )
 
 var (
 	KeyCurrentTerm  = []byte("CurrentTerm")
 	KeyLastVoteTerm = []byte("LastVoteTerm")
 	KeyLastVoteCand = []byte("LastVoteCand")
+
+	ErrLogNotFound = errors.New("log not found")
 )
 
 func init() {
@@ -43,6 +50,20 @@ func min(a, b uint64) uint64 {
 	}
 	return b
 }
+
+// max returns the maximum.
+func max(a, b uint64) uint64 {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+type uint64Slice []uint64
+
+func (p uint64Slice) Len() int           { return len(p) }
+func (p uint64Slice) Less(i, j int) bool { return p[i] < p[j] }
+func (p uint64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 
 type ServerID string
 type ServerAddress string
@@ -65,11 +86,140 @@ type Configuration struct {
 	Server []Server
 }
 
+func DefaultServers() []Server {
+	serverList := make([]Server, 1)
+	serverList[0].Address = "127.0.0.1:11000"
+	serverList[0].ID = "node1"
+	serverList[0].Suffrage = Voter
+	return serverList
+}
+
+func DefaultConfiguration() Configuration {
+	var configuration Configuration
+	configuration.Server = DefaultServers()
+	return configuration
+}
+
+type followerReplication struct {
+	currentTerm uint64
+
+	nextIndex uint64
+
+	peer Server
+
+	commitment *commitment
+
+	/*
+		leader关闭某个follower的RSM时，将最后的log index写入到这个channel，
+		RSM应该在退出之前尽力而为的将日志发送．
+	*/
+	stopCh chan uint64
+
+	// triggerCh用于通知有新消息添加到leader的log中了．
+	triggerCh chan struct{}
+
+	lastContact     time.Time
+	lastContactLock sync.RWMutex
+
+	// failures统计RPC最近错误的次数，用于在回退时使用．
+	failures uint64
+
+	stepDown chan struct{}
+
+	allowPipeline bool
+}
+
+// LastContact returns the time of last contact.
+func (s *followerReplication) LastContact() time.Time {
+	s.lastContactLock.RLock()
+	last := s.lastContact
+	s.lastContactLock.RUnlock()
+	return last
+}
+
+// setLastContact sets the last contact to the current time.
+func (s *followerReplication) setLastContact() {
+	s.lastContactLock.Lock()
+	s.lastContact = time.Now()
+	s.lastContactLock.Unlock()
+}
+
+type commitment struct {
+	// protects matchIndexes and commitIndex
+	sync.Mutex
+	// notified when commitIndex increases
+	commitCh chan struct{}
+	// voter ID to log index: the server stores up through this log entry
+	matchIndexes map[ServerID]uint64
+	// a quorum stores up through this log entry. monotonically increases.
+	commitIndex uint64
+	// the first index of this leader's term: this needs to be replicated to a
+	// majority of the cluster before this leader may mark anything committed
+	// (per Raft's commitment rule)
+	startIndex uint64
+}
+
+func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64) *commitment {
+	matchIndexes := make(map[ServerID]uint64)
+	for _, server := range configuration.Server {
+		if server.Suffrage == Voter {
+			matchIndexes[server.ID] = 0
+		}
+	}
+	return &commitment{
+		commitCh:     commitCh,
+		matchIndexes: matchIndexes,
+		commitIndex:  0,
+		startIndex:   startIndex,
+	}
+}
+
+func (c *commitment) match(server ServerID, matchIndex uint64) {
+	fmt.Printf("ServerID: %s,  matchIndex: %d\n", server, matchIndex)
+	c.Lock()
+	defer c.Unlock()
+	if prev, hasVote := c.matchIndexes[server]; hasVote && matchIndex > prev {
+		c.matchIndexes[server] = matchIndex
+		c.recalculate()
+	}
+}
+
+func (c *commitment) recalculate() {
+	if len(c.matchIndexes) == 0 {
+		return
+	}
+
+	matched := make([]uint64, 0, len(c.matchIndexes))
+	for serverID, idx := range c.matchIndexes {
+		fmt.Printf("-----\n%s -> %d\n-----\n", serverID, idx)
+		matched = append(matched, idx)
+	}
+	sort.Sort(uint64Slice(matched))
+	quorumMatchIndex := matched[(len(matched)-1)/2]
+	fmt.Printf("matched: %v,  quorumMatchIndex: %d,  commitIndex: %d\n\n", matched, quorumMatchIndex, c.commitIndex)
+
+	if quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {
+		c.commitIndex = quorumMatchIndex
+		asyncNotifyCh(c.commitCh)
+	}
+}
+
+// LeaderState是当我们成为领导者时使用的状态。
+type leaderState struct {
+	leadershipTransferInProgress int32 // indicates that a leadership transfer is in progress.
+	commitCh                     chan struct{}
+	commitment                   *commitment
+	inflight                     *list.List // list of logFuture in log index order
+	replState                    map[ServerID]*followerReplication
+	stepDown                     chan struct{}
+}
+
 type Raft struct {
 	currentTerm uint64 // 当前的Term，持久化存储
 	commitIndex uint64 // 当前commit的index(leader的commit index总是领先于follower)
 	lastApplied uint64 // 最后被应用到FSM的index
 
+	// 集群配置
 	configurations Configuration
 
 	lastLock sync.Mutex
@@ -85,6 +235,8 @@ type Raft struct {
 
 	followerNextIndex  map[ServerAddress]uint64
 	followerMatchIndex map[ServerAddress]uint64
+
+	leaderState leaderState
 
 	logger hclog.Logger
 
@@ -120,6 +272,10 @@ type Raft struct {
 
 	routinesGroup sync.WaitGroup
 	state         uint32
+}
+
+func (r *Raft) String() string {
+	return fmt.Sprintf("Node at %s [%v]", r.localAddr, r.GetState())
 }
 
 func (r *Raft) GetState() uint32 {
@@ -199,8 +355,8 @@ func (r *Raft) ApplyLog(log Log, timeout time.Duration) *LogFuture {
 	}
 
 	logFuture := &LogFuture{
-		log: Log{
-			Type:       LogCommand,
+		log: raft.Log{
+			Type:       raft.LogCommand,
 			Data:       log.Data,
 			Extensions: log.Extensions,
 		},
@@ -223,6 +379,8 @@ type Config struct {
 
 	LogOutput io.Writer
 	LogLevel  string
+
+	MaxAppendEntries int
 }
 
 func DefaultConfig() *Config {
@@ -232,6 +390,7 @@ func DefaultConfig() *Config {
 		CommitTimeout:    50 * time.Millisecond,
 		LogOutput:        os.Stderr,
 		LogLevel:         "DEBUG",
+		MaxAppendEntries: 64,
 	}
 }
 
@@ -244,8 +403,10 @@ type Log struct {
 }
 
 type LogFuture struct {
-	log Log
-	err error
+	err      error
+	log      raft.Log
+	response interface{}
+	dispatch time.Time
 }
 
 // LogStore is used to provide an interface for storing
@@ -363,6 +524,8 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 		fsm:       fsm,
 		trans:     trans,
 	}
+
+	r.configurations = DefaultConfiguration()
 
 	r.rpcCh = trans.Consumer()
 
@@ -876,6 +1039,368 @@ func (r *Raft) runCandidate() {
 	}
 }
 
+func (r *Raft) setupLeaderState() {
+	r.leaderState.commitCh = make(chan struct{}, 1)
+	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
+		r.configurations, r.GetLastIndex()+1)
+	r.leaderState.replState = make(map[ServerID]*followerReplication)
+	r.leaderState.stepDown = make(chan struct{}, 1)
+}
+
 func (r *Raft) runLeader() {
-	log.Panicln("we are in leader...")
+	r.logger.Info("entering leader state", "leader", r)
+
+	r.setupLeaderState()
+
+	// 退出leader状态时的清理
+	defer func() {
+		r.SetLastContact()
+
+		// 直接关闭每个follower的RSM
+		// 和startStopReplication关闭RSM不一样
+		// 这里是直接关闭，并没有在退出前发送全部日志
+		// 因为startStopReplication是正常关闭，这里的关闭是因为我们已经不是leader
+		// 需要立刻进入到follower状态
+		for _, p := range r.leaderState.replState {
+			close(p.stopCh)
+		}
+
+		r.leaderState.commitCh = nil
+		r.leaderState.commitment = nil
+		r.leaderState.replState = nil
+		r.leaderState.stepDown = nil
+
+		r.leaderLock.Lock()
+		if r.leader == r.localAddr {
+			r.leader = ""
+		}
+		r.leaderLock.Unlock()
+	}()
+
+	// 根据follower的数量，启动或停止相应数量的复制状态机
+	r.startStopReplication()
+
+	noop := &LogFuture{
+		log: raft.Log{
+			Type: raft.LogNoop,
+		},
+	}
+	r.dispatchLogs([]*LogFuture{noop})
+
+	r.leaderLoop()
+}
+
+// asyncNotifyCh is used to do an async channel send
+// to a single channel without blocking.
+func asyncNotifyCh(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+/*
+启动或停止follower的复制状态机
+*/
+func (r *Raft) startStopReplication() {
+	inConfig := make(map[ServerID]bool, len(r.configurations.Server))
+	lastIdx := r.GetLastIndex()
+
+	for _, server := range r.configurations.Server {
+		if server.ID == r.localID {
+			continue
+		}
+		// 统计有多少个follower
+		inConfig[server.ID] = true
+
+		// 如果follower没启动过RSM，就启动它
+		if _, ok := r.leaderState.replState[server.ID]; !ok {
+			r.logger.Info("added peer, starting replication", "peer", server.ID)
+			s := &followerReplication{
+				peer:        server,
+				commitment:  r.leaderState.commitment,
+				stopCh:      make(chan uint64, 1),
+				triggerCh:   make(chan struct{}, 1),
+				currentTerm: r.GetCurrentTerm(),
+				nextIndex:   lastIdx + 1,
+				lastContact: time.Now(),
+				stepDown:    r.leaderState.stepDown,
+			}
+			// 保存每个follower的RSM
+			r.leaderState.replState[server.ID] = s
+			// 启动复制函数
+			r.goFunc(func() { r.replicate(s) })
+			// 立刻通知RSM开始复制
+			asyncNotifyCh(s.triggerCh)
+		}
+	}
+
+	// 如果follower减少了就停止对应的RSM
+	for serverID, repl := range r.leaderState.replState {
+		if inConfig[serverID] {
+			continue
+		}
+
+		r.logger.Info("removed peer, stopping replication", "peer", serverID, "last-index", lastIdx)
+		// 关闭RSM之前将当前last index发送，让RSM在退出前把所有日志发出去
+		repl.stopCh <- lastIdx
+		// 通知RSM关闭
+		close(repl.stopCh)
+		delete(r.leaderState.replState, serverID)
+	}
+}
+
+func (r *Raft) leaderLoop() {
+	
+}
+
+/*
+
+ */
+func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
+	term := r.GetCurrentTerm()
+	lastIndex := r.GetLastIndex()
+
+	n := len(applyLogs)
+	logs := make([]*raft.Log, n)
+
+	for idx, applyLog := range applyLogs {
+		lastIndex++
+		applyLog.log.Term = term
+		applyLog.log.Index = lastIndex
+		logs[idx] = &applyLog.log
+	}
+
+	err := r.logs.StoreLogs(logs)
+	if err != nil {
+		r.logger.Error("failed to commit logs", "error", err)
+		for _, applyLog := range applyLogs {
+			applyLog.err = err
+		}
+		r.SetState(Follower)
+		return
+	}
+
+	r.leaderState.commitment.match(r.localID, lastIndex)
+	r.SetLastLog(lastIndex, term)
+
+	for _, f := range r.leaderState.replState {
+		asyncNotifyCh(f.triggerCh)
+	}
+
+}
+
+func backoff(base time.Duration, round, limit uint64) time.Duration {
+	power := min(round, limit)
+	for power > 2 {
+		base *= 2
+		power--
+	}
+	return base
+}
+
+func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
+	var failures uint64
+	req := AppendEntriesRPCRequest{
+		term:     r.currentTerm,
+		leaderId: string(r.leader),
+	}
+
+	var resp AppendEntriesRPCResponse
+	for {
+		// 等待下一次心跳间隔
+		select {
+		case <-randomTimeout(r.config.HeartbeatTimeout / 10):
+		case <-stopCh:
+			return
+		}
+
+		err := r.trans.AppendEntries(string(s.peer.ID), s.peer.Address, &req, &resp)
+		if err != nil {
+			// 传输心跳失败则增加失败计数
+			r.logger.Error("failed to heartbeat to", "peer", s.peer.Address, "error", err)
+			failures++
+			select {
+			// 指数回退
+			case <-time.After(backoff(failureWait, failures, maxFailureScale)):
+			case <-stopCh:
+			}
+		} else {
+			failures = 0
+		}
+	}
+}
+
+func (r *Raft) replicate(s *followerReplication) {
+	// 启动heartbeat处理函数
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat) // 函数退出时关闭heartbeats处理函数
+	r.goFunc(func() { r.heartbeat(s, stopHeartbeat) })
+
+	shouldStop := false // 调用发送AE的函数，返回是否需要停止RSM
+	for !shouldStop {
+		select {
+		// startStopReplication关闭RSM将最大的lastLogIndex发送到stopCh
+		// 这里接收到之后会把最后的日志发送完成后再退出
+		case maxIndex := <-s.stopCh:
+			if maxIndex > 0 {
+				r.replicateTo(s, maxIndex)
+			}
+			return
+		case <-s.triggerCh:
+			// 获取本地的所有日志发送给follower
+			lastLogIdx, _ := r.GetLastLog()
+			shouldStop = r.replicateTo(s, lastLogIdx)
+		case <-randomTimeout(r.config.CommitTimeout):
+			// 由于heartbeat不发送leaderCommit值，而且follower由于网络和磁盘
+			// 阻塞可能不能及时知道leaderCommit，所以在超时之前尽快发送.
+			lastLogIdx, _ := r.GetLastLog()
+			shouldStop = r.replicateTo(s, lastLogIdx)
+		}
+
+		// 如果上面发送AE给follower一切正常，且允许流水线方式发送.
+		if !shouldStop && s.allowPipeline {
+			// goto pipeline
+		}
+	}
+	return
+}
+
+func (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop bool) {
+	var req AppendEntriesRPCRequest
+	var resp AppendEntriesRPCResponse
+START:
+	// 如果和follower通信的失败次数大于0，则以10毫秒为基础使用指数回退
+	if s.failures > 0 {
+		select {
+		case <-time.After(backoff(failureWait, s.failures, maxFailureScale)):
+		case <-r.shutdownCh:
+		}
+	}
+
+	// 从follower的nextIndex开始，直到leader本地的lastIndex开始，在req内保存日志
+	err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex)
+	if err == ErrLogNotFound {
+		// goto SEND_SNAP
+	} else if err != nil {
+		return
+	}
+
+	// 将日志发送给follower
+	err = r.trans.AppendEntries(string(s.peer.ID), s.peer.Address, &req, &resp)
+	if err != nil {
+		r.logger.Error("failed to appendEntries to", "peer", s.peer, "error", err)
+		s.failures++
+		return
+	}
+
+	// 如果收到了follower的term比自己大，说明集群内已经有新leader
+	if resp.term > req.term {
+		asyncNotifyCh(s.stepDown)
+		return true
+	}
+
+	// 设置当前follower的最后联系时间
+	s.setLastContact()
+
+	if resp.success {
+		// follower响应成功，更新follower的nextIndex
+		// 并统计index是否被大多数follower写盘
+		updateLastAppended(s, &req)
+
+		s.failures = 0
+		s.allowPipeline = true
+	} else {
+		// 如果失败，设置下一个要发送的index为follower响应的index
+		atomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.lastLog+1), 1))
+
+		if resp.noRetryBackoff {
+			s.failures = 0
+		} else {
+			s.failures++
+		}
+	}
+
+	// 如果收到stopCh的停止信号，就返回shouldStop为true
+	// 需要关闭的场景有：
+	// 1. 整个leader退出，在leaderLoop函数退出时会关闭所有follower的RSM
+	// 2. startStopReplication函数中单独的关闭某个follower的RSM
+	select {
+	case <-s.stopCh:
+		return true
+	default:
+	}
+
+	// 如果经过一次发送follower回应的nextIndex还是小于本地最后的index
+	// 就再次发送
+	if atomic.LoadUint64(&s.nextIndex) <= lastIndex {
+		goto START
+	}
+
+	return
+}
+
+func updateLastAppended(s *followerReplication, req *AppendEntriesRPCRequest) {
+	// Mark any inflight logs as committed
+	if logs := req.entries; len(logs) > 0 {
+		last := logs[len(logs)-1]
+		atomic.StoreUint64(&s.nextIndex, last.Index+1)
+		s.commitment.match(s.peer.ID, last.Index)
+	}
+}
+
+func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRPCRequest, nextIndex, lastIndex uint64) error {
+	req.term = s.currentTerm
+	req.leaderId = string(r.leader)
+	req.leaderCommit = r.GetCommitIndex()
+
+	err := r.setPreviousLog(req, nextIndex)
+	if err != nil {
+		return err
+	}
+
+	err = r.setNewLogs(req, nextIndex, lastIndex)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *Raft) setPreviousLog(req *AppendEntriesRPCRequest, nextIndex uint64) error {
+	if nextIndex == 1 {
+		req.prevLogIndex = 0
+		req.prevLogTerm = 0
+	} else {
+		var l raft.Log
+		err := r.logs.GetLog(nextIndex-1, &l)
+		if err != nil {
+			r.logger.Error("failed to get log", "index", nextIndex-1, "error", err)
+			return err
+		}
+
+		req.prevLogIndex = l.Index
+		req.prevLogTerm = l.Term
+	}
+
+	return nil
+}
+
+func (r *Raft) setNewLogs(req *AppendEntriesRPCRequest, nextIndex, lastIndex uint64) error {
+	req.entries = make([]*raft.Log, 0, r.config.MaxAppendEntries)
+	maxIndex := min(nextIndex+uint64(r.config.MaxAppendEntries)-1, lastIndex)
+
+	for i := nextIndex; i <= maxIndex; i++ {
+		oldLog := new(raft.Log)
+		err := r.logs.GetLog(i, oldLog)
+
+		if err != nil {
+			r.logger.Error("failed to get log", "index", i, "error", err)
+			return err
+		}
+
+		req.entries = append(req.entries, oldLog)
+	}
+
+	return nil
 }

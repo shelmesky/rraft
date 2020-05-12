@@ -35,7 +35,10 @@ var (
 	KeyLastVoteTerm = []byte("LastVoteTerm")
 	KeyLastVoteCand = []byte("LastVoteCand")
 
-	ErrLogNotFound = errors.New("log not found")
+	ErrLogNotFound    = errors.New("log not found")
+	ErrNotLeader      = errors.New("node is not the leader")
+	ErrRaftShutdown   = errors.New("raft is already shutdown")
+	ErrEnqueueTimeout = errors.New("timed out enqueuing operation")
 )
 
 func init() {
@@ -204,14 +207,30 @@ func (c *commitment) recalculate() {
 	}
 }
 
+// Called by leader after commitCh is notified
+func (c *commitment) getCommitIndex() uint64 {
+	c.Lock()
+	defer c.Unlock()
+	return c.commitIndex
+}
+
 // LeaderState是当我们成为领导者时使用的状态。
 type leaderState struct {
 	leadershipTransferInProgress int32 // indicates that a leadership transfer is in progress.
 	commitCh                     chan struct{}
 	commitment                   *commitment
-	inflight                     *list.List // list of logFuture in log index order
-	replState                    map[ServerID]*followerReplication
-	stepDown                     chan struct{}
+
+	// leader发送log时，同时保存一份日志到inflight，
+	// 等收到log被follower提交的channel通知，就从inflight中取出log，
+	// 最后对每个log设置错误信息，等待接收结果的ApplyLog就能得到错误信息。
+	inflight *list.List // list of logFuture in log index order
+
+	replState map[ServerID]*followerReplication
+
+	// stepDown初始化时赋值给每个RSM，它们在复制日志时，
+	// 如果发生需要降级到follower的情况，就向这个channel发送消息，
+	// 在leaderLoop中读取这个channel，做对应的降级动作。
+	stepDown chan struct{}
 }
 
 type Raft struct {
@@ -344,11 +363,11 @@ func (r *Raft) SetLastContact() {
 	r.lastContactLock.Unlock()
 }
 
-func (r *Raft) Apply(cmd []byte, timeout time.Duration) *LogFuture {
+func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 	return r.ApplyLog(Log{Data: cmd}, timeout)
 }
 
-func (r *Raft) ApplyLog(log Log, timeout time.Duration) *LogFuture {
+func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 	var timer <-chan time.Time
 	if timeout > 0 {
 		timer = time.After(timeout)
@@ -362,11 +381,11 @@ func (r *Raft) ApplyLog(log Log, timeout time.Duration) *LogFuture {
 		},
 	}
 
+	logFuture.init()
+
 	select {
 	case <-timer:
-		return &LogFuture{
-			err: fmt.Errorf("ApplyLog timeout!"),
-		}
+		return errorFuture{ErrEnqueueTimeout}
 	case r.applyCh <- logFuture:
 		return logFuture
 	}
@@ -400,13 +419,6 @@ type Log struct {
 	Type       LogType
 	Data       []byte
 	Extensions []byte
-}
-
-type LogFuture struct {
-	err      error
-	log      raft.Log
-	response interface{}
-	dispatch time.Time
 }
 
 // LogStore is used to provide an interface for storing
@@ -878,14 +890,23 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
 	}
 
 	for idx := lastApplied + 1; idx <= index; idx++ {
-		l := new(raft.Log)
-		err := r.logs.GetLog(idx, l)
-		if err != nil {
-			r.logger.Error("failed to get log", "index", idx, "error", err)
-			panic(err)
+		future, futureOk := futures[idx]
+		if futureOk {
+			r.fsmMutateCh <- &future.log
+		} else {
+			l := new(raft.Log)
+			err := r.logs.GetLog(idx, l)
+			if err != nil {
+				r.logger.Error("failed to get log", "index", idx, "error", err)
+				panic(err)
+			}
+
+			r.fsmMutateCh <- l
 		}
 
-		r.fsmMutateCh <- l
+		if futureOk {
+			future.respond(nil)
+		}
 	}
 
 }
@@ -1043,6 +1064,7 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.commitCh = make(chan struct{}, 1)
 	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
 		r.configurations, r.GetLastIndex()+1)
+	r.leaderState.inflight = list.New()
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.stepDown = make(chan struct{}, 1)
 }
@@ -1151,7 +1173,68 @@ func (r *Raft) startStopReplication() {
 }
 
 func (r *Raft) leaderLoop() {
-	
+	stepDown := false
+
+	for r.GetState() == Leader {
+		select {
+		case rpc := <-r.rpcCh:
+			r.processRPC(rpc)
+
+		case <-r.leaderState.stepDown:
+			r.SetState(Follower)
+
+		case <-r.leaderState.commitCh:
+			commitIndex := r.leaderState.commitment.getCommitIndex()
+			r.SetCommitIndex(commitIndex)
+
+			var groupReady []*list.Element
+			var groupFutures = make(map[uint64]*LogFuture)
+			var lastIdxInGroup uint64
+
+			for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
+				commitLog := e.Value.(*LogFuture)
+				idx := commitLog.log.Index
+				if idx > commitIndex {
+					break
+				}
+
+				groupReady = append(groupReady, e)
+				groupFutures[idx] = commitLog
+			}
+
+			if len(groupReady) > 0 {
+				r.processLogs(lastIdxInGroup, groupFutures)
+
+				for _, e := range groupReady {
+					r.leaderState.inflight.Remove(e)
+				}
+			}
+
+		case newLog := <-r.applyCh:
+			ready := []*LogFuture{newLog}
+
+		GROUP_COMMIT_LOOP:
+			for i := 0; i < r.config.MaxAppendEntries; i++ {
+				select {
+				case newLog := <-r.applyCh:
+					ready = append(ready, newLog)
+				default:
+					break GROUP_COMMIT_LOOP
+				}
+			}
+
+			if stepDown {
+				for i := range ready {
+					ready[i].err = ErrNotLeader
+				}
+			} else {
+				r.dispatchLogs(ready)
+			}
+
+		case <-r.shutdownCh:
+			return
+		}
+	}
 }
 
 /*
@@ -1169,6 +1252,7 @@ func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
 		applyLog.log.Term = term
 		applyLog.log.Index = lastIndex
 		logs[idx] = &applyLog.log
+		r.leaderState.inflight.PushBack(applyLog)
 	}
 
 	err := r.logs.StoreLogs(logs)

@@ -39,7 +39,6 @@ func NewRaftServer(raftDir, raftBind, httpBind string) *KVStore {
 func (s *KVStore) Open(localID ServerID) error {
 	config := DefaultConfig()
 
-
 	transport, err := NewTCPTransport(localID, s.RaftBind)
 	if err != nil {
 		return err
@@ -121,7 +120,7 @@ func (s *KVStore) Set(key, value string) error {
 
 	raftTimeout := 10 * time.Second
 	f := s.raft.Apply(b, raftTimeout)
-	return f.err
+	return f.Error()
 }
 
 type fsm KVStore

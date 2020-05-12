@@ -676,6 +676,7 @@ func (r *Raft) processRPC(rpc RPC) {
 }
 
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
+	r.logger.Info("we are in appendEntries...")
 	resp := &AppendEntriesRPCResponse{
 		term:           r.GetCurrentTerm(),
 		lastLog:        r.GetLastIndex(),
@@ -921,6 +922,8 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
 			future.respond(nil)
 		}
 	}
+
+	r.SetLastApplied(index)
 
 }
 

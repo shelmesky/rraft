@@ -1216,6 +1216,7 @@ func (r *Raft) leaderLoop() {
 
 				groupReady = append(groupReady, e)
 				groupFutures[idx] = commitLog
+				lastIdxInGroup = idx
 			}
 
 			if len(groupReady) > 0 {

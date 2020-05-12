@@ -294,12 +294,25 @@ type Raft struct {
 }
 
 func (r *Raft) String() string {
-	return fmt.Sprintf("Node at %s [%v]", r.localAddr, r.GetState())
+	return fmt.Sprintf("Node at %s [%v]", r.localAddr, stateAsString(r.GetState()))
 }
 
 func (r *Raft) GetState() uint32 {
 	stateAddr := (*uint32)(&r.state)
 	return atomic.LoadUint32(stateAddr)
+}
+
+func stateAsString(state uint32) string {
+	switch state {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	default:
+		return "UnKnow State"
+	}
 }
 
 func (r *Raft) SetState(s uint32) {

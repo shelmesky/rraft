@@ -635,23 +635,31 @@ func (r *Raft) runFSM() {
 
 func (r *Raft) runFollower() {
 	r.logger.Info("entering follower state", "follower", r, "leader", r.Leader())
+
+	// 生成心跳超时
 	heartbeatTimer := randomTimeout(r.config.HeartbeatTimeout)
 	for r.GetState() == Follower {
 		select {
+		// 处理RPC请求
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
+		// 发生了心跳超时
 		case <-heartbeatTimer:
+			// 再生成一个新的心跳超时，在下一次循环中用到
 			heartbeatTimer = randomTimeout(r.config.HeartbeatTimeout)
 
+			// 查看心跳是否超时
 			lastContact := r.LastContact()
 			if time.Now().Sub(lastContact) < r.config.HeartbeatTimeout {
 				continue
 			}
 
+			// 清空当天leader
 			lastLeader := r.Leader()
 			r.SetLeader("")
 
+			// 进入到Candidate状态
 			r.logger.Warn("heartbeat timeout reached, starting election", "last-leader", lastLeader)
 			r.SetState(Candidate)
 			return
@@ -1029,18 +1037,22 @@ func (r *Raft) persistVote(term uint64, candidate string) error {
 func (r *Raft) runCandidate() {
 	r.logger.Info("entering candidate state", "node", r, "term", r.GetCurrentTerm()+1)
 
+	// 从voteCh中可以异步读取到各个节点(包括当前节点自身)的投票响应
 	voteCh := r.electSelf()
 
+	// 生成一个随机的投票超时时间
 	electionTimer := randomTimeout(r.config.ElectionTimeout)
 
-	grantedVote := 0
-	votesNeeded := r.quorumSize()
+	grantedVote := 0	// 赞成票的数量
+	votesNeeded := r.quorumSize()	// 实际需要达到的票数(n/2-1)
 
 	for r.GetState() == Candidate {
 		select {
+		// Candidate状态下可以接受其他节点的投票请求
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
+		// 从投票响应的channel中读取投票响应
 		case vote := <-voteCh:
 			if vote.term > r.GetCurrentTerm() {
 				// 收到了比自己term高的回应，说明新leader已经选出
@@ -1088,6 +1100,11 @@ func (r *Raft) setupLeaderState() {
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 
+	// leaderState保存了在leader状态时的一些关键信息：
+	// 1. follower的日志提交
+	// 2. 每个follower的复制状态机
+	// 3. inflight数组：如果一个日志已经提交，leader需要从inflight中取出它并回复给client.
+	// 4. stepDown的channel: 在日志复制过程中，如果探测出了更新的Leader，则通过这个channel通知leader
 	r.setupLeaderState()
 
 	// 退出leader状态时的清理
@@ -1103,6 +1120,7 @@ func (r *Raft) runLeader() {
 			close(p.stopCh)
 		}
 
+		// 清空leaderState状态
 		r.leaderState.commitCh = nil
 		r.leaderState.commitment = nil
 		r.leaderState.replState = nil
@@ -1118,6 +1136,7 @@ func (r *Raft) runLeader() {
 	// 根据follower的数量，启动或停止相应数量的复制状态机
 	r.startStopReplication()
 
+	// 在当选为Leader后，立刻发送一个空日志给所有Follower，这样顺带就把之前Term的日志一起提交了.
 	noop := &LogFuture{
 		log: raft.Log{
 			Type: raft.LogNoop,
@@ -1125,6 +1144,7 @@ func (r *Raft) runLeader() {
 	}
 	r.dispatchLogs([]*LogFuture{noop})
 
+	// 开始Leader循环
 	r.leaderLoop()
 }
 
@@ -1193,20 +1213,28 @@ func (r *Raft) leaderLoop() {
 
 	for r.GetState() == Leader {
 		select {
+		// 处理RPC请求
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
+		// 在leader运行中是否发生需要降级为follower
 		case <-r.leaderState.stepDown:
 			r.SetState(Follower)
 
+		// 发送给follower的日志被提交，就需要处理提交后的事情
 		case <-r.leaderState.commitCh:
+			// 获取当前最大的已提交日志
 			commitIndex := r.leaderState.commitment.getCommitIndex()
+			// 设置当前最大的已提交日志
 			r.SetCommitIndex(commitIndex)
 
 			var groupReady []*list.Element
 			var groupFutures = make(map[uint64]*LogFuture)
 			var lastIdxInGroup uint64
 
+			// inflight数组中临时保存了之前RSM发送日志时的另一份日志
+			// 也就是说发送给follower之前，leader即写日志到自己本地，也同时保存了一份到inflight
+			// 现在从中取出已提交的日志，需要利用这些日志，来回复还在等待的client
 			for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
 				commitLog := e.Value.(*LogFuture)
 				idx := commitLog.log.Index
@@ -1219,7 +1247,11 @@ func (r *Raft) leaderLoop() {
 				lastIdxInGroup = idx
 			}
 
+			// 写入到FSM并移除inflight中保存的临时日志
 			if len(groupReady) > 0 {
+				// lastIdxGroup是这些已提交日志中最大的index
+				// groupFutures是从inflight取出的已提交日志
+				// processLogs把它们发送给FSM处理，同时使用日志中携带的Future功能回复client
 				r.processLogs(lastIdxInGroup, groupFutures)
 
 				for _, e := range groupReady {
@@ -1227,9 +1259,11 @@ func (r *Raft) leaderLoop() {
 				}
 			}
 
+		// 从ApplyLog函数收到的新日志
 		case newLog := <-r.applyCh:
 			ready := []*LogFuture{newLog}
 
+		// 一次性尽量收集更多的日志
 		GROUP_COMMIT_LOOP:
 			for i := 0; i < r.config.MaxAppendEntries; i++ {
 				select {
@@ -1245,6 +1279,7 @@ func (r *Raft) leaderLoop() {
 					ready[i].err = ErrNotLeader
 				}
 			} else {
+				// leader写入日志到本地磁盘，并通知RSM复制日志
 				r.dispatchLogs(ready)
 			}
 

@@ -555,15 +555,16 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 
 	// 初始化Raft结构
 	r := &Raft{
-		localID:   localID,
-		localAddr: localAddr,
-		logger:    logger,
-		logs:      logs,
-		stable:    stable,
-		applyCh:   make(chan *LogFuture),
-		config:    config,
-		fsm:       fsm,
-		trans:     trans,
+		localID:     localID,
+		localAddr:   localAddr,
+		logger:      logger,
+		logs:        logs,
+		stable:      stable,
+		applyCh:     make(chan *LogFuture),
+		config:      config,
+		fsm:         fsm,
+		fsmMutateCh: make(chan interface{}, 128),
+		trans:       trans,
 	}
 
 	// 默认节点配置
@@ -1248,20 +1249,28 @@ func (r *Raft) startStopReplication() {
 
 // 循环运行leader
 func (r *Raft) leaderLoop() {
+	r.logger.Info("enter leaderLoop() function")
+	defer func() {
+		r.logger.Info("leave leaderLoop() function")
+	}()
 	stepDown := false
 
 	for r.GetState() == Leader {
+
 		select {
 		// 处理RPC请求
 		case rpc := <-r.rpcCh:
+			r.logger.Info("leaderLoop rpcCh...")
 			r.processRPC(rpc)
 
 		// 在leader运行中检查是否需要降级为follower
 		case <-r.leaderState.stepDown:
+			r.logger.Info("leaderLoop stepDown...")
 			r.SetState(Follower)
 
 		// 发送给follower的日志被提交，就需要处理提交后的事情
 		case <-r.leaderState.commitCh:
+			r.logger.Info("leaderLoop commitCh...")
 			// 获取当前最大的已提交日志
 			commitIndex := r.leaderState.commitment.getCommitIndex()
 			// 设置当前最大的已提交日志
@@ -1300,6 +1309,7 @@ func (r *Raft) leaderLoop() {
 
 		// 从ApplyLog函数收到的新日志
 		case newLog := <-r.applyCh:
+			r.logger.Info("leaderLoop applyCh...")
 			ready := []*LogFuture{newLog}
 
 			// 一次性尽量收集更多的日志
@@ -1332,6 +1342,8 @@ func (r *Raft) leaderLoop() {
 Leader分发日志：现写一份日志到Leader本地磁盘，再通知RSM复制日志给Follower
 */
 func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
+	fmt.Printf("dispatchLogs: %v\n", applyLogs[0])
+
 	// 获取当前leader的最后日志Index和Term
 	term := r.GetCurrentTerm()
 	lastIndex := r.GetLastIndex()

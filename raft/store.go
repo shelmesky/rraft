@@ -126,6 +126,7 @@ func (s *KVStore) Set(key, value string) error {
 
 	raftTimeout := 10 * time.Second
 	f := s.raft.Apply(b, raftTimeout)
+	fmt.Println("apply logs to leader, wait response...")
 	return f.Error()
 }
 
@@ -137,6 +138,8 @@ func (f *fsm) Apply(log *raft.Log) interface{} {
 	if err := json.Unmarshal(log.Data, &c); err != nil {
 		panic(fmt.Sprintf("failed to unmarshal command: %s", err.Error()))
 	}
+
+	f.raft.logger.Info("FSM receive command:", c)
 
 	switch c.Op {
 	case "set":

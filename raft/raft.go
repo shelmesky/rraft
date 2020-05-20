@@ -472,17 +472,17 @@ type FSM interface {
 	Apply(*raft.Log) interface{}
 }
 
-// AE请求
+// 日志追加请求
 type AppendEntriesRPCRequest struct {
-	term         uint64
-	leaderId     string
-	prevLogIndex uint64
-	prevLogTerm  uint64
-	entries      []*raft.Log
-	leaderCommit uint64
+	term         uint64      // Leader当前的Term
+	leaderId     string      // Leader ID
+	prevLogIndex uint64      // Leader中记录的前一个日志的Index
+	prevLogTerm  uint64      // Leader中记录的前一个日志的Term
+	entries      []*raft.Log // Leader发送的多个日志序列
+	leaderCommit uint64      // Leader当前最大已提交日志的Index
 }
 
-// AE响应
+// 日志追加请求的响应
 type AppendEntriesRPCResponse struct {
 	lastLog        uint64 // follower本地日志index
 	term           uint64 // follower本地的term
@@ -490,6 +490,7 @@ type AppendEntriesRPCResponse struct {
 	noRetryBackoff bool   // 是否需要尝试并匹配日志，不需要则leader直接从头发送
 }
 
+// 投票请求
 type RequestVoteRPCRequest struct {
 	term         uint64
 	candidateID  string
@@ -497,11 +498,13 @@ type RequestVoteRPCRequest struct {
 	lastLogTerm  uint64
 }
 
+// 投票请求的响应
 type RequestVoteRPCResponse struct {
 	term        uint64
 	voteGranted bool
 }
 
+// 使用新的goroutine启动一个函数
 func (r *Raft) goFunc(f func()) {
 	r.routinesGroup.Add(1)
 	go func() {
@@ -510,20 +513,32 @@ func (r *Raft) goFunc(f func()) {
 	}()
 }
 
+/*
+config: 全局配置
+fsm: 有限状态机
+logs: 日志持久存储
+stable: 存储Raft协议中需要持久话的字段
+localID: 当前节点ID
+localAddr: 当前节点Raft协议监听地址
+trans: 传输层的抽象接口
+*/
 func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 	stable raft.StableStore, localID ServerID,
 	localAddr ServerAddress, trans Transport) (*Raft, error) {
 
+	// 从持久化存储中活动currentTerm字段
 	currentTerm, err := stable.GetUint64(KeyCurrentTerm)
 	if err != nil && err.Error() != "not found" {
 		return nil, fmt.Errorf("failed to load current term: %v", err)
 	}
 
+	// 从日志存储中获取最后的日志Index
 	lastIndex, err := logs.LastIndex()
 	if err != nil {
 		return nil, fmt.Errorf("failed to find last log: %v", err)
 	}
 
+	// 尝试获取最后的日志项内容
 	var lastLog raft.Log
 	if lastIndex > 0 {
 		if err = logs.GetLog(lastIndex, &lastLog); err != nil {
@@ -538,6 +553,7 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 		Output: config.LogOutput,
 	})
 
+	// 初始化Raft结构
 	r := &Raft{
 		localID:   localID,
 		localAddr: localAddr,
@@ -550,19 +566,25 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 		trans:     trans,
 	}
 
+	// 默认配置
 	r.configurations = DefaultConfiguration()
 
+	// 使用rcpCh从传输层接收RPC请求
 	r.rpcCh = trans.Consumer()
 
+	// 立即设置心跳处理函数
 	trans.SetHeartbeatHandler(r.processHeartbeat)
 
+	// 初始化状态为Follower
 	r.SetState(Follower)
 
+	// 设置内存中的currentTerm
 	r.SetCurrentTerm(currentTerm)
+	// 设置内存中最后日志的Index和Term
 	r.SetLastLog(lastLog.Index, lastLog.Term)
 
-	r.goFunc(r.run)
-	r.goFunc(r.runFSM)
+	r.goFunc(r.run)    // 启动Raft协议核心
+	r.goFunc(r.runFSM) // 启动有限状态机
 
 	return r, nil
 }
@@ -580,6 +602,7 @@ func (r *Raft) SetLeader(leader ServerAddress) {
 	r.leaderLock.Unlock()
 }
 
+// 根据当前状态运行对应的处理函数
 func (r *Raft) run() {
 	for {
 		select {
@@ -608,7 +631,7 @@ func newSeed() int64 {
 	return r.Int64()
 }
 
-// randomTimeout returns a value that is between the minVal and 2x minVal.
+// 生成随机的时间：在minVal和2倍minVal之间
 func randomTimeout(minVal time.Duration) <-chan time.Time {
 	if minVal == 0 {
 		return nil
@@ -617,22 +640,24 @@ func randomTimeout(minVal time.Duration) <-chan time.Time {
 	return time.After(minVal + extra)
 }
 
+// 循环运行有限状态机
 func (r *Raft) runFSM() {
 	for {
 		select {
-		case ptr := <-r.fsmMutateCh:
+		case ptr := <-r.fsmMutateCh: // 在leader和follower中当日志确认提交时，交给FSM执行
 			switch req := ptr.(type) {
 			case *raft.Log:
 				r.fsm.Apply(req)
 			default:
 				panic(fmt.Errorf("bad type passed to fsmMutateCh: %#v", ptr))
 			}
-		case <-r.shutdownCh:
+		case <-r.shutdownCh: // 退出FSM
 			return
 		}
 	}
 }
 
+// 循环运行Follower
 func (r *Raft) runFollower() {
 	r.logger.Info("entering follower state", "follower", r, "leader", r.Leader())
 
@@ -655,7 +680,7 @@ func (r *Raft) runFollower() {
 				continue
 			}
 
-			// 清空当天leader
+			// 清空当前leader
 			lastLeader := r.Leader()
 			r.SetLeader("")
 
@@ -670,11 +695,12 @@ func (r *Raft) runFollower() {
 	}
 }
 
+// 根据RPC类型处理RCP请求，在Follower/Leader/Candidate状态下都会运行此函数
 func (r *Raft) processRPC(rpc RPC) {
 	switch cmd := rpc.Command.(type) {
-	case *AppendEntriesRPCRequest:
+	case *AppendEntriesRPCRequest: // 日志追加请求：从Leader发向Follower
 		r.appendEntries(rpc, cmd)
-	case *RequestVoteRPCRequest:
+	case *RequestVoteRPCRequest: // 投票请求：从Candidate发向其他任意状态节点
 		r.requestVote(rpc, cmd)
 	default:
 		r.logger.Error("got unexpected command",
@@ -683,6 +709,7 @@ func (r *Raft) processRPC(rpc RPC) {
 	}
 }
 
+// 处理日志追加请求：任意状态下都可能收到
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 	r.logger.Info("we are in appendEntries...")
 	resp := &AppendEntriesRPCResponse{
@@ -704,7 +731,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 	}
 
 	/*
-		因为不止Follower会处理AE请求，Candidate也会处理，所以如果是Candidate状态
+		因为不止Follower会处理AE请求，Candidate和Leader状态也会收到，所以如果不是Follower状态
 		并收到了更大term的AE请求，则进入Follower状态并设置更大的Term.
 	*/
 	if a.term > r.GetCurrentTerm() || r.GetState() != Follower {
@@ -904,18 +931,23 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 
 // 将日志应用到FSM
 func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
-	lastApplied := r.GetLastApplied()
+	lastApplied := r.GetLastApplied() // 最后应用到状态机的日志Index
 
+	// 小于lastApplied认为是旧日志
 	if index <= lastApplied {
 		r.logger.Warn("skipping application of old log", "index", index)
 		return
 	}
 
+	// 从lastApplied循环到index，依次处理日志
+	// futures是在Leader的inflight数组中保存了ApplyLog函数生成的日志副本
 	for idx := lastApplied + 1; idx <= index; idx++ {
 		future, futureOk := futures[idx]
 		if futureOk {
+			// 如果在inflight中存在日志Index，则使用inflight暂存的日志副本发送给FSM
 			r.fsmMutateCh <- &future.log
 		} else {
+			// 否则就根据日志Index从本地日志库中查询日志，然后发送给FSM
 			l := new(raft.Log)
 			err := r.logs.GetLog(idx, l)
 			if err != nil {
@@ -926,11 +958,14 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
 			r.fsmMutateCh <- l
 		}
 
+		// 特别注意：如果在futures存在日志副本，需要给这个日志响应nil
+		// 目的是让Leader回复nil给还在ApplyLog函数中等待的client
 		if futureOk {
 			future.respond(nil)
 		}
 	}
 
+	// 每次处理一个，就设置FSM的last applied
 	r.SetLastApplied(index)
 
 }
@@ -1034,6 +1069,7 @@ func (r *Raft) persistVote(term uint64, candidate string) error {
 	return nil
 }
 
+// 循环运行Candidate
 func (r *Raft) runCandidate() {
 	r.logger.Info("entering candidate state", "node", r, "term", r.GetCurrentTerm()+1)
 
@@ -1043,8 +1079,8 @@ func (r *Raft) runCandidate() {
 	// 生成一个随机的投票超时时间
 	electionTimer := randomTimeout(r.config.ElectionTimeout)
 
-	grantedVote := 0	// 赞成票的数量
-	votesNeeded := r.quorumSize()	// 实际需要达到的票数(n/2-1)
+	grantedVote := 0              // 赞成票的数量
+	votesNeeded := r.quorumSize() // 实际需要达到的票数(n/2-1)
 
 	for r.GetState() == Candidate {
 		select {
@@ -1088,15 +1124,17 @@ func (r *Raft) runCandidate() {
 	}
 }
 
+// 进入Leader状态，立即初始化Leader的各种状态信息数据
 func (r *Raft) setupLeaderState() {
-	r.leaderState.commitCh = make(chan struct{}, 1)
-	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
+	r.leaderState.commitCh = make(chan struct{}, 1)                  // 用于RSM发送给leader循环的已提交日志Index
+	r.leaderState.commitment = newCommitment(r.leaderState.commitCh, // RSM统计每个Follower的已提交日志Index
 		r.configurations, r.GetLastIndex()+1)
-	r.leaderState.inflight = list.New()
-	r.leaderState.replState = make(map[ServerID]*followerReplication)
-	r.leaderState.stepDown = make(chan struct{}, 1)
+	r.leaderState.inflight = list.New()                               // Leader发送日志给Follower后，临时保存日志在inflight一份副本，用于日志被提交后回复client
+	r.leaderState.replState = make(map[ServerID]*followerReplication) // 管理每个Follower的复制状态机
+	r.leaderState.stepDown = make(chan struct{}, 1)                   // RSM在运行过程中，发现需要降级为Follower，就向这个channel发送数据
 }
 
+// 循环运行Leader
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 
@@ -1208,6 +1246,7 @@ func (r *Raft) startStopReplication() {
 	}
 }
 
+// 循环运行leader
 func (r *Raft) leaderLoop() {
 	stepDown := false
 
@@ -1217,7 +1256,7 @@ func (r *Raft) leaderLoop() {
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
-		// 在leader运行中是否发生需要降级为follower
+		// 在leader运行中检查是否需要降级为follower
 		case <-r.leaderState.stepDown:
 			r.SetState(Follower)
 
@@ -1233,7 +1272,7 @@ func (r *Raft) leaderLoop() {
 			var lastIdxInGroup uint64
 
 			// inflight数组中临时保存了之前RSM发送日志时的另一份日志
-			// 也就是说发送给follower之前，leader即写日志到自己本地，也同时保存了一份到inflight
+			// 也就是说发送给follower之前，leader写日志到自己本地，也同时保存了一份到inflight
 			// 现在从中取出已提交的日志，需要利用这些日志，来回复还在等待的client
 			for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
 				commitLog := e.Value.(*LogFuture)
@@ -1263,7 +1302,7 @@ func (r *Raft) leaderLoop() {
 		case newLog := <-r.applyCh:
 			ready := []*LogFuture{newLog}
 
-		// 一次性尽量收集更多的日志
+			// 一次性尽量收集更多的日志
 		GROUP_COMMIT_LOOP:
 			for i := 0; i < r.config.MaxAppendEntries; i++ {
 				select {
@@ -1290,15 +1329,17 @@ func (r *Raft) leaderLoop() {
 }
 
 /*
-
- */
+Leader分发日志：现写一份日志到Leader本地磁盘，再通知RSM复制日志给Follower
+*/
 func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
+	// 获取当前leader的最后日志Index和Term
 	term := r.GetCurrentTerm()
 	lastIndex := r.GetLastIndex()
 
 	n := len(applyLogs)
 	logs := make([]*raft.Log, n)
 
+	// 循环给每个日志设置index和term，并同时把日志保存到inflight中一份.
 	for idx, applyLog := range applyLogs {
 		lastIndex++
 		applyLog.log.Term = term
@@ -1307,8 +1348,10 @@ func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
 		r.leaderState.inflight.PushBack(applyLog)
 	}
 
+	// leader保存日志到自己的日志库中
 	err := r.logs.StoreLogs(logs)
 	if err != nil {
+		// 如果保存出错就回退到Follower状态
 		r.logger.Error("failed to commit logs", "error", err)
 		for _, applyLog := range applyLogs {
 			applyLog.err = err
@@ -1317,9 +1360,13 @@ func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
 		return
 	}
 
+	// 将刚才保存的日志的index发送给统计日志是否提交的函数
 	r.leaderState.commitment.match(r.localID, lastIndex)
+
+	// 设置leader中最后日志的Index和Term
 	r.SetLastLog(lastIndex, term)
 
+	// 通知每个Follower的RSM
 	for _, f := range r.leaderState.replState {
 		asyncNotifyCh(f.triggerCh)
 	}
@@ -1335,8 +1382,10 @@ func backoff(base time.Duration, round, limit uint64) time.Duration {
 	return base
 }
 
+// Leader用于不停发送心跳给Follower的函数
 func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 	var failures uint64
+	// 空的日志追加请求，不含日志
 	req := AppendEntriesRPCRequest{
 		term:     r.currentTerm,
 		leaderId: string(r.leader),
@@ -1351,6 +1400,7 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 			return
 		}
 
+		// 发送心跳给Follower
 		err := r.trans.AppendEntries(string(s.peer.ID), s.peer.Address, &req, &resp)
 		if err != nil {
 			// 传输心跳失败则增加失败计数
@@ -1367,6 +1417,7 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 	}
 }
 
+// RSM核心函数，循环运行
 func (r *Raft) replicate(s *followerReplication) {
 	// 启动heartbeat处理函数
 	stopHeartbeat := make(chan struct{})
@@ -1402,6 +1453,7 @@ func (r *Raft) replicate(s *followerReplication) {
 	return
 }
 
+// 实际发送日志追加请求给Follower的函数
 func (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop bool) {
 	var req AppendEntriesRPCRequest
 	var resp AppendEntriesRPCResponse
@@ -1485,16 +1537,20 @@ func updateLastAppended(s *followerReplication, req *AppendEntriesRPCRequest) {
 	}
 }
 
+// 为每个日志追加请求设置前一个Index和Term，以及应该发送的日志.
 func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRPCRequest, nextIndex, lastIndex uint64) error {
+	//  设置当前的Index和Term，以及Leader当前的已提交Index
 	req.term = s.currentTerm
 	req.leaderId = string(r.leader)
 	req.leaderCommit = r.GetCommitIndex()
 
+	// 设置前一个日志的Index和Term
 	err := r.setPreviousLog(req, nextIndex)
 	if err != nil {
 		return err
 	}
 
+	// 设置所有应该发送的日志
 	err = r.setNewLogs(req, nextIndex, lastIndex)
 	if err != nil {
 		return err
@@ -1503,6 +1559,7 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRPCR
 	return nil
 }
 
+// Leader根据某个Follower的nextIndex设置应该发送给它的PrevIndex和PrevTerm
 func (r *Raft) setPreviousLog(req *AppendEntriesRPCRequest, nextIndex uint64) error {
 	if nextIndex == 1 {
 		req.prevLogIndex = 0
@@ -1522,6 +1579,7 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRPCRequest, nextIndex uint64) er
 	return nil
 }
 
+// Leader从某个Follower的nextIndex开始直到lastIndex，查询应该发送给Follower的日志．
 func (r *Raft) setNewLogs(req *AppendEntriesRPCRequest, nextIndex, lastIndex uint64) error {
 	req.entries = make([]*raft.Log, 0, r.config.MaxAppendEntries)
 	maxIndex := min(nextIndex+uint64(r.config.MaxAppendEntries)-1, lastIndex)

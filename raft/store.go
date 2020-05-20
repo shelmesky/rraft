@@ -3,8 +3,10 @@ package raft
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/gorilla/mux"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
+	"io"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -69,15 +71,15 @@ func (s *KVStore) Open(localID ServerID) error {
 
 	s.raft = ra
 
-	// HTTP接口
-	http.HandleFunc("/get", s.HandleGet)
-	http.HandleFunc("/set", s.HandleSet)
-
 	return nil
 }
 
 func (s *KVStore) Run() error {
-	return http.ListenAndServe(s.HttpBind, nil)
+	r := mux.NewRouter()
+	r.HandleFunc("/get/{key}", s.HandleGet)
+	r.HandleFunc("/set", s.HandleSet)
+
+	return http.ListenAndServe(s.HttpBind, r)
 }
 
 // SET命令
@@ -98,7 +100,27 @@ func (s *KVStore) HandleSet(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *KVStore) HandleGet(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
 
+	key := vars["key"]
+
+	if key == "" {
+		w.WriteHeader(http.StatusBadRequest)
+	}
+
+	v, err := s.Get(key)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	b, err := json.Marshal(map[string]string{key: v})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	io.WriteString(w, string(b))
 }
 
 // Get函数根据key返回value

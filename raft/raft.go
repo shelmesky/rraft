@@ -566,7 +566,7 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 		trans:     trans,
 	}
 
-	// 默认配置
+	// 默认节点配置
 	r.configurations = DefaultConfiguration()
 
 	// 使用rcpCh从传输层接收RPC请求

@@ -36,14 +36,17 @@ func NewRaftServer(raftDir, raftBind, httpBind string) *KVStore {
 	}
 }
 
+// 创建一个KV存储服务
 func (s *KVStore) Open(localID ServerID) error {
-	config := DefaultConfig()
+	config := DefaultConfig() // 默认Raft配置
 
+	// TCP传输层
 	transport, err := NewTCPTransport(localID, s.RaftBind)
 	if err != nil {
 		return err
 	}
 
+	// 持久化的日志存储和Raft属性存储
 	var logStore raft.LogStore
 	var stableStore raft.StableStore
 
@@ -56,6 +59,7 @@ func (s *KVStore) Open(localID ServerID) error {
 
 	localAddr := ServerAddress(s.RaftBind)
 
+	// 创建新的Raft实例
 	ra, err := NewRaft(config, (*fsm)(s), logStore, stableStore,
 		localID, localAddr, transport)
 
@@ -65,6 +69,7 @@ func (s *KVStore) Open(localID ServerID) error {
 
 	s.raft = ra
 
+	// HTTP接口
 	http.HandleFunc("/get", s.HandleGet)
 	http.HandleFunc("/set", s.HandleSet)
 
@@ -75,6 +80,7 @@ func (s *KVStore) Run() error {
 	return http.ListenAndServe(s.HttpBind, nil)
 }
 
+// SET命令
 func (s *KVStore) HandleSet(w http.ResponseWriter, req *http.Request) {
 	m := map[string]string{}
 	if err := json.NewDecoder(req.Body).Decode(&m); err != nil {
@@ -95,14 +101,14 @@ func (s *KVStore) HandleGet(w http.ResponseWriter, req *http.Request) {
 
 }
 
-// Get returns the value for the given key.
+// Get函数根据key返回value
 func (s *KVStore) Get(key string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.m[key], nil
 }
 
-// Set sets the value for the given key.
+// Set函数根据key设置value
 func (s *KVStore) Set(key, value string) error {
 	if s.raft.GetState() != Leader {
 		return fmt.Errorf("not leader")
@@ -123,6 +129,7 @@ func (s *KVStore) Set(key, value string) error {
 	return f.Error()
 }
 
+// FSM提供Apply函数
 type fsm KVStore
 
 func (f *fsm) Apply(log *raft.Log) interface{} {

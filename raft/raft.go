@@ -932,6 +932,8 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 
 // 将日志应用到FSM
 func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
+	fmt.Printf("processLogs: %d, futures: %v\n", index, futures)
+
 	lastApplied := r.GetLastApplied() // 最后应用到状态机的日志Index
 
 	// 小于lastApplied认为是旧日志
@@ -944,9 +946,10 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
 	// futures是在Leader的inflight数组中保存了ApplyLog函数生成的日志副本
 	for idx := lastApplied + 1; idx <= index; idx++ {
 		future, futureOk := futures[idx]
+		var log *raft.Log
 		if futureOk {
 			// 如果在inflight中存在日志Index，则使用inflight暂存的日志副本发送给FSM
-			r.fsmMutateCh <- &future.log
+			log = &future.log
 		} else {
 			// 否则就根据日志Index从本地日志库中查询日志，然后发送给FSM
 			l := new(raft.Log)
@@ -956,8 +959,15 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
 				panic(err)
 			}
 
-			r.fsmMutateCh <- l
+			log = l
 		}
+
+		// 不向FSM发送Noop命令
+		if log.Type == raft.LogNoop {
+			continue
+		}
+
+		r.fsmMutateCh <- log
 
 		// 特别注意：如果在futures存在日志副本，需要给这个日志响应nil
 		// 目的是让Leader回复nil给还在ApplyLog函数中等待的client

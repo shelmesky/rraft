@@ -934,6 +934,11 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 func (r *Raft) processLogs(index uint64, futures map[uint64]*LogFuture) {
 	fmt.Printf("processLogs: %d, futures: %v\n", index, futures)
 
+	/*
+		每次重启之后，发送Noop日志会引发最少一次提交，由于lastApplied没有持久化，
+		所以每次重启之后lastApplied都是0，就导致从0开始读取本地的日志并发送到FSM.
+		创建快照后，重启Raft尝试从快照恢复restoreSnapshot()可以防止每次都从0开始重复读取日志.
+	*/
 	lastApplied := r.GetLastApplied() // 最后应用到状态机的日志Index
 
 	// 小于lastApplied认为是旧日志

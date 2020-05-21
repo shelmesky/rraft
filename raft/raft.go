@@ -693,13 +693,36 @@ func (r *Raft) processRPC(rpc RPC) {
 	}
 }
 
+func dumpAERequest(caller string, a *AppendEntriesRPCRequest) bool {
+	fmt.Printf("*********** %s ***********\n", caller)
+	fmt.Printf("Term: %d, PrevLogIndex: %d, PrevLogTerm: %d, Leader CommitIndex: %d\n", a.Term, a.PrevLogIndex,
+		a.PrevLogTerm, a.LeaderCommit)
+
+	isData := false
+
+	if len(a.Entries) > 0 {
+		for idx := range a.Entries {
+			fmt.Printf("--------------------------")
+			entry := a.Entries[idx]
+			fmt.Printf("Term: %d, Index: %d, Type: %d, Data: %s\n", entry.Term, entry.Index,
+				entry.Type, string(entry.Data))
+			if entry.Type == 0 {
+				isData = true
+			}
+		}
+	} else {
+		fmt.Println("Just heartbeat signal...")
+	}
+
+	fmt.Printf("*********** %s ***********\n", caller)
+
+	return isData
+}
+
 // 处理日志追加请求：任意状态下都可能收到
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
-	r.logger.Info("we are in appendEntries...")
-
-	if len(a.Entries) == 0 {
-		r.logger.Info("收到心跳信号...")
-	}
+	isData := dumpAERequest("appendEntries", a)
+	fmt.Println("Is NOOP:", isData)
 
 	resp := &AppendEntriesRPCResponse{
 		Term:           r.GetCurrentTerm(),
@@ -716,6 +739,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 
 	// 如果AE请求中的term小于本地的，则直接返回
 	if a.Term < r.GetCurrentTerm() {
+		r.logger.Error("", "AE请求中的Term小于本地：%d < %d\n", a.Term, r.GetCurrentTerm())
 		return
 	}
 
@@ -745,6 +769,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 			var prevLog raft.Log
 			err := r.logs.GetLog(a.PrevLogIndex, &prevLog)
 			if err != nil {
+				r.logger.Error("", "PrevLogIndex: 无法在本地查询到日志Index：%d\n", a.PrevLogIndex)
 				// leader应该直接从头开始发送
 				resp.NoRetryBackoff = true
 				return
@@ -762,64 +787,71 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 			不匹配则leader应该从头发送日志．
 		*/
 		if a.PrevLogTerm != prevLogTerm {
+			r.logger.Error("", "本地的PrevTerm不等于AE请求中的PrevTerm: %d != %d\n", a.PrevLogTerm, prevLogTerm)
 			resp.NoRetryBackoff = true
 			return
 		}
+	}
 
-		// 循环处理每一条日志
-		if len(a.Entries) > 0 {
-			lastLogIdx, _ := r.GetLastLog()
+	// 循环处理每一条日志
+	if len(a.Entries) > 0 {
+		lastLogIdx, _ := r.GetLastLog()
 
-			var newEntries []*raft.Log
+		var newEntries []*raft.Log
 
-			for i, entry := range a.Entries {
-				if entry.Index > lastLogIdx {
-					newEntries = a.Entries[i:]
-					break
-				}
+		for i, entry := range a.Entries {
+			if entry.Index > lastLogIdx {
+				newEntries = a.Entries[i:]
+				break
+			}
 
-				var storeEntry raft.Log
-				err := r.logs.GetLog(entry.Index, &storeEntry)
+			var storeEntry raft.Log
+			err := r.logs.GetLog(entry.Index, &storeEntry)
+			if err != nil {
+				r.logger.Error("", "Entries: 无法在本地查询到日志Index：%d\n", entry.Index)
+				return
+			}
+
+			if entry.Term != storeEntry.Term {
+				err := r.logs.DeleteRange(entry.Index, lastLogIdx)
 				if err != nil {
+					r.logger.Error("", "在本地删除日志失败：从 %d 到 %d\n", entry.Index, lastLogIdx)
 					return
 				}
 
-				if entry.Term != storeEntry.Term {
-					err := r.logs.DeleteRange(entry.Index, lastLogIdx)
-					if err != nil {
-						return
-					}
-
-					newEntries = a.Entries[i:]
-					break
-				}
-			}
-
-			if n := len(newEntries); n > 0 {
-				// 保存所有应该保存的日志项
-				err := r.logs.StoreLogs(newEntries)
-				if err != nil {
-					return
-				}
-
-				if len(newEntries) > 0 {
-					last := newEntries[n-1]
-					// 设置lastLogIndex和lastTerm
-					r.SetLastLog(last.Index, last.Term)
-				}
+				newEntries = a.Entries[i:]
+				break
 			}
 		}
 
-		// 如果leader的commit index大于本地的commit index
-		if a.LeaderCommit > 0 && a.LeaderCommit > r.GetCommitIndex() {
-			// leader的commit index可能大于本地last log index，也可能小于
-			// 如果leader的commit index打，说明本地比leader差了很多日志，应该使用本地刚写入磁盘的日志作为commit index
-			// 否则直接使用leader的commit index
-			idx := min(a.LeaderCommit, r.GetLastIndex())
-			r.SetCommitIndex(idx)
-			// 将直到commit index的日志项，都应用到FSM中
-			r.processLogs(idx, nil)
+		if n := len(newEntries); n > 0 {
+			r.logger.Info("", "收到 %d 条日志!!!\n", len(newEntries))
+			// 保存所有应该保存的日志项
+			err := r.logs.StoreLogs(newEntries)
+			if err != nil {
+				r.logger.Error("", "在本地保存日志失败：%s\n", err)
+				return
+			}
+
+			last := newEntries[n-1]
+			// 设置lastLogIndex和lastTerm
+			r.SetLastLog(last.Index, last.Term)
+
 		}
+	}
+
+	// 如果leader的commit index大于本地的commit index
+	r.logger.Error("检查Leader的commit index是否大于本地: %d > %d\n", a.LeaderCommit, r.GetCommitIndex())
+	if a.LeaderCommit > 0 && a.LeaderCommit > r.GetCommitIndex() {
+		// leader的commit index可能大于本地last log index，也可能小于
+		// 如果leader的commit index打，说明本地比leader差了很多日志，应该使用本地刚写入磁盘的日志作为commit index
+		// 否则直接使用leader的commit index
+		idx := min(a.LeaderCommit, r.GetLastIndex())
+		r.SetCommitIndex(idx)
+		// 将直到commit index的日志项，都应用到FSM中
+		// !!! 注意：由于上面min函数的关系，这里的idx总比leader小1 !!!
+		// !!! 所有只有
+		r.processLogs(idx, nil)
 	}
 
 	fmt.Printf("更新心跳时间...\n")
@@ -1384,6 +1416,7 @@ func (r *Raft) dispatchLogs(applyLogs []*LogFuture) {
 	r.SetLastLog(lastIndex, term)
 
 	// 通知每个Follower的RSM
+	// 有N个follower就通知N次
 	for _, f := range r.leaderState.replState {
 		asyncNotifyCh(f.triggerCh)
 	}
@@ -1498,6 +1531,8 @@ START:
 	} else if err != nil {
 		return
 	}
+
+	dumpAERequest("replicateTo", &req)
 
 	// 将日志发送给follower
 	err = r.trans.AppendEntries(string(s.peer.ID), s.peer.Address, &req, &resp)

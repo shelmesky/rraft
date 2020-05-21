@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -39,11 +40,11 @@ func NewRaftServer(raftDir, raftBind, httpBind string) *KVStore {
 }
 
 // 创建一个KV存储服务
-func (s *KVStore) Open(localID ServerID) error {
+func (s *KVStore) Open(localID string) error {
 	config := DefaultConfig() // 默认Raft配置
 
 	// TCP传输层
-	transport, err := NewTCPTransport(localID, s.RaftBind)
+	transport, err := NewTCPTransport(ServerID(localID), s.RaftBind)
 	if err != nil {
 		return err
 	}
@@ -74,12 +75,17 @@ func (s *KVStore) Open(localID ServerID) error {
 	return nil
 }
 
-func (s *KVStore) Run() error {
-	r := mux.NewRouter()
-	r.HandleFunc("/get/{key}", s.HandleGet)
-	r.HandleFunc("/set", s.HandleSet)
+func (s *KVStore) Run() {
+	go func() {
+		r := mux.NewRouter()
+		r.HandleFunc("/get/{key}", s.HandleGet)
+		r.HandleFunc("/set", s.HandleSet)
 
-	return http.ListenAndServe(s.HttpBind, r)
+		err := http.ListenAndServe(s.HttpBind, r)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "HTTP server start failed: %s\n", err)
+		}
+	}()
 }
 
 // SET命令

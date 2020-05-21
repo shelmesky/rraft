@@ -523,7 +523,7 @@ localAddr: 当前节点Raft协议监听地址
 trans: 传输层的抽象接口
 */
 func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
-	stable raft.StableStore, localID ServerID,
+	stable raft.StableStore, localID string,
 	localAddr ServerAddress, trans Transport) (*Raft, error) {
 
 	// 从持久化存储中活动currentTerm字段
@@ -555,7 +555,7 @@ func NewRaft(config *Config, fsm FSM, logs raft.LogStore,
 
 	// 初始化Raft结构
 	r := &Raft{
-		localID:     localID,
+		localID:     ServerID(localID),
 		localAddr:   localAddr,
 		logger:      logger,
 		logs:        logs,

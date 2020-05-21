@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"github.com/hashicorp/raft"
 	"io"
 	"log"
 	"net"
@@ -41,11 +42,52 @@ type RPCResponse struct {
 	Error    error
 }
 
+// 日志追加请求
+type AppendEntriesRPCRequest struct {
+	Term         uint64      // Leader当前的Term
+	LeaderId     string      // Leader ID
+	PrevLogIndex uint64      // Leader中记录的前一个日志的Index
+	PrevLogTerm  uint64      // Leader中记录的前一个日志的Term
+	Entries      []*raft.Log // Leader发送的多个日志序列
+	LeaderCommit uint64      // Leader当前最大已提交日志的Index
+}
+
+// 日志追加请求的响应
+type AppendEntriesRPCResponse struct {
+	LastLog        uint64 // follower本地日志index
+	Term           uint64 // follower本地的term
+	Success        bool   // 是否成功写入到日志
+	NoRetryBackoff bool   // 是否需要尝试并匹配日志，不需要则leader直接从头发送
+}
+
+// 投票请求
+type RequestVoteRPCRequest struct {
+	Term         uint64
+	CandidateID  string
+	LastLogIndex uint64
+	LastLogTerm  uint64
+}
+
+// 投票请求的响应
+type RequestVoteRPCResponse struct {
+	Term        uint64
+	VoteGranted bool
+}
+
 // RPC has a command, and provides a response mechanism.
 type RPC struct {
 	Command  interface{}
 	Reader   io.Reader // Set only for InstallSnapshot
 	RespChan chan RPCResponse
+}
+
+func init() {
+	gob.Register(&RPCRequest{})
+	gob.Register(&RPCResponse{})
+	gob.Register(&AppendEntriesRPCRequest{})
+	gob.Register(&AppendEntriesRPCResponse{})
+	gob.Register(&RequestVoteRPCRequest{})
+	gob.Register(&RequestVoteRPCResponse{})
 }
 
 // Respond is used to respond with a response, error or both
@@ -92,11 +134,17 @@ type TCPTransport struct {
 	heartbeatFnLock sync.Mutex
 }
 
+// 创建新的传输层对象
 func NewTCPTransport(id ServerID, raftBind string) (Transport, error) {
 	transport := new(TCPTransport)
+
+	// 保存对端节点连接
 	transport.clientConns = make(map[ServerAddress]*ConnCoding, 10)
 	transport.connsLock = new(sync.Mutex)
 	transport.localID = id
+
+	// 初始化传递rpc的channel
+	transport.rpcChan = make(chan RPC)
 
 	addr, err := net.ResolveTCPAddr("tcp", raftBind)
 	if err != nil {
@@ -105,6 +153,7 @@ func NewTCPTransport(id ServerID, raftBind string) (Transport, error) {
 
 	transport.localAddr = ServerAddress(raftBind)
 
+	// 开始循环接收请求
 	err = transport.serverLoop(id, addr)
 	if err != nil {
 		return transport, err
@@ -155,6 +204,8 @@ func (trans *TCPTransport) handleConn(conn net.Conn) {
 			return
 		}
 
+		fmt.Printf("Gob Server 收到RPC请求: %v\n", rpcRequest)
+
 		var rpc RPC
 		rpc.Command = rpcRequest.Req
 		rpc.RespChan = make(chan RPCResponse, 1)
@@ -164,19 +215,24 @@ func (trans *TCPTransport) handleConn(conn net.Conn) {
 		// 等待处理的结果
 		select {
 		case resp := <-rpc.RespChan:
+
+			fmt.Printf("Gob Server 从RespChan中收到响应: %v\n", resp)
+
+			respErr := ""
+
 			if resp.Error != nil {
 				log.Println("RPC Response failed:", resp.Error)
-				respErr := ""
-				if resp.Error != nil {
-					respErr = resp.Error.Error()
-				}
-				err := encoder.Encode(respErr)
-				err = encoder.Encode(resp.Response)
-				if err != nil {
-					log.Println("Send RPC Response faield:", err)
-					return
-				}
+				respErr = resp.Error.Error()
 			}
+
+			err := encoder.Encode(respErr)
+			err = encoder.Encode(resp.Response)
+
+			if err != nil {
+				log.Println("Send RPC Response faield:", err)
+				return
+			}
+
 		}
 	}
 }
@@ -186,21 +242,20 @@ func (trans *TCPTransport) getConnCoding(target ServerAddress) (*ConnCoding, err
 	defer trans.connsLock.Unlock()
 
 	if conn, ok := trans.clientConns[target]; ok {
+		fmt.Println("get conn for", target)
 		return conn, nil
 	} else {
+		fmt.Println("crate conn for", target)
 		return trans.dialFollower(target)
 	}
 }
 
 func (trans *TCPTransport) dialFollower(target ServerAddress) (*ConnCoding, error) {
-	timeout := time.Duration(time.Second * 5)
+	timeout := time.Second * 5
 	conn, err := net.DialTimeout("tcp", string(target), timeout)
 	if err != nil {
 		return nil, err
 	}
-
-	trans.connsLock.Lock()
-	defer trans.connsLock.Unlock()
 
 	connCoding := &ConnCoding{
 		conn:    conn,
@@ -260,6 +315,7 @@ func (trans *TCPTransport) AppendEntries(id string, target ServerAddress, args *
 func (trans *TCPTransport) RequestVote(id string, target ServerAddress, args *RequestVoteRPCRequest,
 	resp *RequestVoteRPCResponse) error {
 
+	// 获取连接
 	connCoding, err := trans.getConnCoding(target)
 
 	if err != nil {
@@ -271,25 +327,34 @@ func (trans *TCPTransport) RequestVote(id string, target ServerAddress, args *Re
 		Req:     args,
 	}
 
+	// 发送RPC请求
 	err = connCoding.encoder.Encode(req)
 	if err != nil {
 		return err
 	}
 
+	fmt.Printf("Gob Client 发送了投票请求到: [%s], 内容：[%v]\n", target, req)
+
+	// 接收错误信息
 	respErr := ""
 	err = connCoding.decoder.Decode(&respErr)
 	if err != nil {
 		return err
 	}
 
+	fmt.Printf("Gob Client 收到了 [%s] 投票的错误响应: [%s]\n", target, respErr)
+
 	if respErr != "" {
 		return fmt.Errorf(respErr)
 	}
 
+	// 接收响应
 	err = connCoding.decoder.Decode(resp)
 	if err != nil {
 		return err
 	}
+
+	fmt.Printf("Gob Client 收到了 [%s] 投票的响应: [%v]\n", target, resp)
 
 	return nil
 }

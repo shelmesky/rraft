@@ -90,10 +90,18 @@ type Configuration struct {
 }
 
 func DefaultServers() []Server {
-	serverList := make([]Server, 1)
-	serverList[0].Address = "127.0.0.1:11000"
+	serverList := make([]Server, 3)
+	serverList[0].Address = "127.0.0.1:11001"
 	serverList[0].ID = "node1"
 	serverList[0].Suffrage = Voter
+
+	serverList[1].Address = "127.0.0.1:21001"
+	serverList[1].ID = "node2"
+	serverList[1].Suffrage = Voter
+
+	serverList[2].Address = "127.0.0.1:31001"
+	serverList[2].ID = "node3"
+	serverList[2].Suffrage = Voter
 	return serverList
 }
 
@@ -417,7 +425,7 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
-		HeartbeatTimeout: 1000 * time.Millisecond,
+		HeartbeatTimeout: 10000 * time.Millisecond,
 		ElectionTimeout:  1000 * time.Millisecond,
 		CommitTimeout:    50 * time.Millisecond,
 		LogOutput:        os.Stderr,
@@ -470,38 +478,6 @@ type StableStore interface {
 
 type FSM interface {
 	Apply(*raft.Log) interface{}
-}
-
-// 日志追加请求
-type AppendEntriesRPCRequest struct {
-	term         uint64      // Leader当前的Term
-	leaderId     string      // Leader ID
-	prevLogIndex uint64      // Leader中记录的前一个日志的Index
-	prevLogTerm  uint64      // Leader中记录的前一个日志的Term
-	entries      []*raft.Log // Leader发送的多个日志序列
-	leaderCommit uint64      // Leader当前最大已提交日志的Index
-}
-
-// 日志追加请求的响应
-type AppendEntriesRPCResponse struct {
-	lastLog        uint64 // follower本地日志index
-	term           uint64 // follower本地的term
-	success        bool   // 是否成功写入到日志
-	noRetryBackoff bool   // 是否需要尝试并匹配日志，不需要则leader直接从头发送
-}
-
-// 投票请求
-type RequestVoteRPCRequest struct {
-	term         uint64
-	candidateID  string
-	lastLogIndex uint64
-	lastLogTerm  uint64
-}
-
-// 投票请求的响应
-type RequestVoteRPCResponse struct {
-	term        uint64
-	voteGranted bool
 }
 
 // 使用新的goroutine启动一个函数
@@ -633,12 +609,12 @@ func newSeed() int64 {
 }
 
 // 生成随机的时间：在minVal和2倍minVal之间
-func randomTimeout(minVal time.Duration) <-chan time.Time {
+func randomTimeout(minVal time.Duration) (<-chan time.Time, time.Duration) {
 	if minVal == 0 {
-		return nil
+		return nil, 0
 	}
 	extra := (time.Duration(rand.Int63()) % minVal)
-	return time.After(minVal + extra)
+	return time.After(minVal + extra), minVal + extra
 }
 
 // 循环运行有限状态机
@@ -663,7 +639,8 @@ func (r *Raft) runFollower() {
 	r.logger.Info("entering follower state", "follower", r, "leader", r.Leader())
 
 	// 生成心跳超时
-	heartbeatTimer := randomTimeout(r.config.HeartbeatTimeout)
+	heartbeatTimer, timeout := randomTimeout(r.config.HeartbeatTimeout)
+	fmt.Println("心跳超时：", timeout)
 	for r.GetState() == Follower {
 		select {
 		// 处理RPC请求
@@ -673,10 +650,14 @@ func (r *Raft) runFollower() {
 		// 发生了心跳超时
 		case <-heartbeatTimer:
 			// 再生成一个新的心跳超时，在下一次循环中用到
-			heartbeatTimer = randomTimeout(r.config.HeartbeatTimeout)
+			heartbeatTimer, timeout = randomTimeout(r.config.HeartbeatTimeout)
+			fmt.Println("心跳超时：", timeout)
 
 			// 查看心跳是否超时
 			lastContact := r.LastContact()
+			fmt.Printf("检查心跳是否超时：%v < %v = %v\n", time.Now().Sub(lastContact),
+				r.config.HeartbeatTimeout, time.Now().Sub(lastContact) < r.config.HeartbeatTimeout)
+
 			if time.Now().Sub(lastContact) < r.config.HeartbeatTimeout {
 				continue
 			}
@@ -698,6 +679,8 @@ func (r *Raft) runFollower() {
 
 // 根据RPC类型处理RCP请求，在Follower/Leader/Candidate状态下都会运行此函数
 func (r *Raft) processRPC(rpc RPC) {
+	fmt.Printf("节点 [%s], 状态: [%s] 收到RPC请求: %v\n", r.localID, r.String(), rpc)
+
 	switch cmd := rpc.Command.(type) {
 	case *AppendEntriesRPCRequest: // 日志追加请求：从Leader发向Follower
 		r.appendEntries(rpc, cmd)
@@ -713,11 +696,16 @@ func (r *Raft) processRPC(rpc RPC) {
 // 处理日志追加请求：任意状态下都可能收到
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 	r.logger.Info("we are in appendEntries...")
+
+	if len(a.Entries) == 0 {
+		r.logger.Info("收到心跳信号...")
+	}
+
 	resp := &AppendEntriesRPCResponse{
-		term:           r.GetCurrentTerm(),
-		lastLog:        r.GetLastIndex(),
-		success:        false,
-		noRetryBackoff: false,
+		Term:           r.GetCurrentTerm(),
+		LastLog:        r.GetLastIndex(),
+		Success:        false,
+		NoRetryBackoff: false,
 	}
 
 	var rpcErr error
@@ -727,7 +715,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 	}()
 
 	// 如果AE请求中的term小于本地的，则直接返回
-	if a.term < r.GetCurrentTerm() {
+	if a.Term < r.GetCurrentTerm() {
 		return
 	}
 
@@ -735,30 +723,30 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 		因为不止Follower会处理AE请求，Candidate和Leader状态也会收到，所以如果不是Follower状态
 		并收到了更大term的AE请求，则进入Follower状态并设置更大的Term.
 	*/
-	if a.term > r.GetCurrentTerm() || r.GetState() != Follower {
+	if a.Term > r.GetCurrentTerm() || r.GetState() != Follower {
 		r.SetState(Follower)
-		r.SetCurrentTerm(a.term)
-		resp.term = a.term
+		r.SetCurrentTerm(a.Term)
+		resp.Term = a.Term
 	}
 
 	// 不论任何状态, 任何时候都设置leader为最新的leader
-	r.SetLeader(ServerAddress(a.leaderId))
+	r.SetLeader(ServerAddress(a.LeaderId))
 
-	if a.prevLogIndex > 0 {
+	if a.PrevLogIndex > 0 {
 		lastIdx, lastTerm := r.GetLastLog()
 
 		var prevLogTerm uint64
 
 		// leader发来的日志和本地index相等
-		if a.prevLogIndex == lastIdx {
+		if a.PrevLogIndex == lastIdx {
 			prevLogTerm = lastTerm
 		} else {
 			// leader发来的日志和本地在本地查询不到
 			var prevLog raft.Log
-			err := r.logs.GetLog(a.prevLogIndex, &prevLog)
+			err := r.logs.GetLog(a.PrevLogIndex, &prevLog)
 			if err != nil {
 				// leader应该直接从头开始发送
-				resp.noRetryBackoff = true
+				resp.NoRetryBackoff = true
 				return
 			}
 
@@ -773,20 +761,20 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 			获取到的term和AE请求中的term对比，
 			不匹配则leader应该从头发送日志．
 		*/
-		if a.prevLogTerm != prevLogTerm {
-			resp.noRetryBackoff = true
+		if a.PrevLogTerm != prevLogTerm {
+			resp.NoRetryBackoff = true
 			return
 		}
 
 		// 循环处理每一条日志
-		if len(a.entries) > 0 {
+		if len(a.Entries) > 0 {
 			lastLogIdx, _ := r.GetLastLog()
 
 			var newEntries []*raft.Log
 
-			for i, entry := range a.entries {
+			for i, entry := range a.Entries {
 				if entry.Index > lastLogIdx {
-					newEntries = a.entries[i:]
+					newEntries = a.Entries[i:]
 					break
 				}
 
@@ -802,7 +790,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 						return
 					}
 
-					newEntries = a.entries[i:]
+					newEntries = a.Entries[i:]
 					break
 				}
 			}
@@ -823,26 +811,27 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRPCRequest) {
 		}
 
 		// 如果leader的commit index大于本地的commit index
-		if a.leaderCommit > 0 && a.leaderCommit > r.GetCommitIndex() {
+		if a.LeaderCommit > 0 && a.LeaderCommit > r.GetCommitIndex() {
 			// leader的commit index可能大于本地last log index，也可能小于
 			// 如果leader的commit index打，说明本地比leader差了很多日志，应该使用本地刚写入磁盘的日志作为commit index
 			// 否则直接使用leader的commit index
-			idx := min(a.leaderCommit, r.GetLastIndex())
+			idx := min(a.LeaderCommit, r.GetLastIndex())
 			r.SetCommitIndex(idx)
 			// 将直到commit index的日志项，都应用到FSM中
 			r.processLogs(idx, nil)
 		}
-
-		resp.success = true
-		r.SetLastContact()
 	}
+
+	fmt.Printf("更新心跳时间...\n")
+	resp.Success = true
+	r.SetLastContact()
 }
 
 func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 	// 初始化一个投票响应
 	resp := &RequestVoteRPCResponse{
-		term:        r.GetCurrentTerm(),
-		voteGranted: false,
+		Term:        r.GetCurrentTerm(),
+		VoteGranted: false,
 	}
 
 	var rpcErr error
@@ -850,7 +839,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 		rpc.Respond(resp, rpcErr)
 	}()
 
-	candidateID := req.candidateID
+	candidateID := req.CandidateID
 	leader := r.Leader()
 	// 如果当前存在leader并且leader不是本机
 	if leader != "" && leader != ServerAddress(candidateID) {
@@ -861,22 +850,22 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 	}
 
 	// 如果投票请求的term小于本机，则拒绝投票
-	if req.term < r.GetCurrentTerm() {
+	if req.Term < r.GetCurrentTerm() {
 		return
 	}
 
 	// 如果请求的term大于本机，说明有新leader，则从candidate进入follower状态
 	// 并设置term
-	if req.term > r.GetCurrentTerm() {
-		r.logger.Debug("lost leadership because received a requestVote with a newer term")
+	if req.Term > r.GetCurrentTerm() {
+		r.logger.Debug("enter follower state because we received a requestVote with a newer term")
 		r.SetState(Follower)
-		r.SetCurrentTerm(req.term)
-		resp.term = req.term
+		r.SetCurrentTerm(req.Term)
+		resp.Term = req.Term
 	}
 
 	// 从磁盘获取最后投票的term和candidate信息
 	lastVoteTerm, err := r.stable.GetUint64(KeyLastVoteTerm)
-	if err != nil {
+	if err != nil && err.Error() != "not found" {
 		r.logger.Error("failed to get last vote term", "error", err)
 		return
 	}
@@ -890,11 +879,11 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 	// 如果candidate信息和请求中的一样，说明已经为这个candidate投了一票，但它没有收到投票结果
 	// 所以就再投一次票。
 	// 但如果只是term相同，就说明已经为其他candidate投票，不能再次投票
-	if lastVoteTerm == req.term && lastVoteCandidateBytes != nil {
-		r.logger.Info("duplicate requestVote for same term", "term", req.term)
-		if bytes.Compare(lastVoteCandidateBytes, []byte(req.candidateID)) == 0 {
-			r.logger.Warn("duplicate requestVote from", "candidate", req.candidateID)
-			resp.voteGranted = true
+	if lastVoteTerm == req.Term && lastVoteCandidateBytes != nil {
+		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
+		if bytes.Compare(lastVoteCandidateBytes, []byte(req.CandidateID)) == 0 {
+			r.logger.Warn("duplicate requestVote from", "candidate", req.CandidateID)
+			resp.VoteGranted = true
 		}
 		return
 	}
@@ -902,30 +891,30 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRPCRequest) {
 	// 如果请求的term小于本地term则拒绝投赞成票。
 	// 如果请求的term等于本地term，但请求的index小于本地的也拒绝投赞成票。
 	lastIdx, lastTerm := r.GetLastLog()
-	if lastTerm > req.lastLogTerm {
+	if lastTerm > req.LastLogTerm {
 		r.logger.Warn("rejecting vote request since our last term is greater",
 			"candidate", candidateID,
 			"last-term", lastTerm,
-			"last-candidate-term", req.lastLogTerm)
+			"last-candidate-term", req.LastLogTerm)
 		return
 	}
-	if lastTerm == req.lastLogTerm && lastIdx > req.lastLogIndex {
+	if lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {
 		r.logger.Warn("rejecting vote request since our last index is greater",
 			"candidate", candidateID,
 			"last-index", lastIdx,
-			"last-candidate-index", req.lastLogIndex)
+			"last-candidate-index", req.LastLogIndex)
 		return
 	}
 
 	// 投票之前将term和candidate信息持久化（不能重复投票）
-	err = r.persistVote(req.term, req.candidateID)
+	err = r.persistVote(req.Term, req.CandidateID)
 	if err != nil {
 		r.logger.Error("failed to persist vote", "error", err)
 		return
 	}
 
 	// 投赞成票
-	resp.voteGranted = true
+	resp.VoteGranted = true
 	r.SetLastContact()
 	return
 }
@@ -1018,10 +1007,10 @@ func (r *Raft) electSelf() <-chan *voteResult {
 
 	lastIdx, lastTerm := r.GetLastLog()
 	req := &RequestVoteRPCRequest{
-		term:         r.GetCurrentTerm(),
-		candidateID:  string(r.localID),
-		lastLogIndex: lastIdx,
-		lastLogTerm:  lastTerm,
+		Term:         r.GetCurrentTerm(),
+		CandidateID:  string(r.localID),
+		LastLogIndex: lastIdx,
+		LastLogTerm:  lastTerm,
 	}
 
 	// askPeer将投票请求发送到其他节点，并将响应发送到channel中
@@ -1034,8 +1023,8 @@ func (r *Raft) electSelf() <-chan *voteResult {
 				r.logger.Error("failed to make requestVote RPC",
 					"target", peer,
 					"error", err)
-				resp.term = req.term
-				resp.voteGranted = false
+				resp.Term = req.Term
+				resp.VoteGranted = false
 			}
 
 			respCh <- resp
@@ -1048,7 +1037,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 			// 为自身投票并持久化
 			if server.ID == r.localID {
 				// 模拟收到投票请求并持久化
-				err := r.persistVote(req.term, req.candidateID)
+				err := r.persistVote(req.Term, req.CandidateID)
 				if err != nil {
 					r.logger.Error("failed to persist vote", "error", err)
 					return nil
@@ -1056,8 +1045,8 @@ func (r *Raft) electSelf() <-chan *voteResult {
 
 				respCh <- &voteResult{
 					RequestVoteRPCResponse: RequestVoteRPCResponse{
-						term:        req.term,
-						voteGranted: true,
+						Term:        req.Term,
+						VoteGranted: true,
 					},
 					voterID: r.localID,
 				}
@@ -1093,7 +1082,8 @@ func (r *Raft) runCandidate() {
 	voteCh := r.electSelf()
 
 	// 生成一个随机的投票超时时间
-	electionTimer := randomTimeout(r.config.ElectionTimeout)
+	electionTimer, timeout := randomTimeout(r.config.ElectionTimeout)
+	fmt.Println("选举超时：", timeout)
 
 	grantedVote := 0              // 赞成票的数量
 	votesNeeded := r.quorumSize() // 实际需要达到的票数(n/2-1)
@@ -1106,19 +1096,19 @@ func (r *Raft) runCandidate() {
 
 		// 从投票响应的channel中读取投票响应
 		case vote := <-voteCh:
-			if vote.term > r.GetCurrentTerm() {
+			if vote.Term > r.GetCurrentTerm() {
 				// 收到了比自己term高的回应，说明新leader已经选出
 				// 应该进入Follower状态，并设置term为新leader的term
 				r.logger.Debug("newer term discovered, fallback to follower")
 				r.SetState(Follower)
-				r.SetCurrentTerm(vote.term)
+				r.SetCurrentTerm(vote.Term)
 				return
 			}
 
 			// 统计赞成票的数量
-			if vote.voteGranted {
+			if vote.VoteGranted {
 				grantedVote++
-				r.logger.Debug("vote granted", "from", vote.voterID, "term", vote.term, "tally", grantedVote)
+				r.logger.Debug("vote granted", "from", vote.voterID, "term", vote.Term, "tally", grantedVote)
 			}
 
 			// 收到了足够的赞成票，进入Leader状态
@@ -1414,20 +1404,23 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 	var failures uint64
 	// 空的日志追加请求，不含日志
 	req := AppendEntriesRPCRequest{
-		term:     r.currentTerm,
-		leaderId: string(r.leader),
+		Term:     r.currentTerm,
+		LeaderId: string(r.leader),
 	}
 
 	var resp AppendEntriesRPCResponse
 	for {
 		// 等待下一次心跳间隔
+		timeoutChan, timeout := randomTimeout(r.config.HeartbeatTimeout / 10)
+		fmt.Println("发送心跳间隔：", timeout)
 		select {
-		case <-randomTimeout(r.config.HeartbeatTimeout / 10):
+		case <-timeoutChan:
 		case <-stopCh:
 			return
 		}
 
 		// 发送心跳给Follower
+		r.logger.Info("发送心跳给: ", s.peer.ID)
 		err := r.trans.AppendEntries(string(s.peer.ID), s.peer.Address, &req, &resp)
 		if err != nil {
 			// 传输心跳失败则增加失败计数
@@ -1453,6 +1446,8 @@ func (r *Raft) replicate(s *followerReplication) {
 
 	shouldStop := false // 调用发送AE的函数，返回是否需要停止RSM
 	for !shouldStop {
+		//commitTimeoutChan, timeout := randomTimeout(r.config.CommitTimeout)
+		//fmt.Println("提交超时：", timeout)
 		select {
 		// startStopReplication关闭RSM将最大的lastLogIndex发送到stopCh
 		// 这里接收到之后会把最后的日志发送完成后再退出
@@ -1465,11 +1460,14 @@ func (r *Raft) replicate(s *followerReplication) {
 			// 获取本地的所有日志发送给follower
 			lastLogIdx, _ := r.GetLastLog()
 			shouldStop = r.replicateTo(s, lastLogIdx)
-		case <-randomTimeout(r.config.CommitTimeout):
-			// 由于heartbeat不发送leaderCommit值，而且follower由于网络和磁盘
-			// 阻塞可能不能及时知道leaderCommit，所以在超时之前尽快发送.
-			lastLogIdx, _ := r.GetLastLog()
-			shouldStop = r.replicateTo(s, lastLogIdx)
+			/*
+				case <-commitTimeoutChan:
+					// 由于heartbeat不发送leaderCommit值，而且follower由于网络和磁盘
+					// 阻塞可能不能及时知道leaderCommit，所以在超时之前尽快发送.
+					lastLogIdx, _ := r.GetLastLog()
+					shouldStop = r.replicateTo(s, lastLogIdx)
+
+			*/
 		}
 
 		// 如果上面发送AE给follower一切正常，且允许流水线方式发送.
@@ -1510,7 +1508,7 @@ START:
 	}
 
 	// 如果收到了follower的term比自己大，说明集群内已经有新leader
-	if resp.term > req.term {
+	if resp.Term > req.Term {
 		asyncNotifyCh(s.stepDown)
 		return true
 	}
@@ -1518,7 +1516,7 @@ START:
 	// 设置当前follower的最后联系时间
 	s.setLastContact()
 
-	if resp.success {
+	if resp.Success {
 		// follower响应成功，更新follower的nextIndex
 		// 并统计index是否被大多数follower写盘
 		updateLastAppended(s, &req)
@@ -1527,9 +1525,9 @@ START:
 		s.allowPipeline = true
 	} else {
 		// 如果失败，设置下一个要发送的index为follower响应的index
-		atomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.lastLog+1), 1))
+		atomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))
 
-		if resp.noRetryBackoff {
+		if resp.NoRetryBackoff {
 			s.failures = 0
 		} else {
 			s.failures++
@@ -1557,7 +1555,7 @@ START:
 
 func updateLastAppended(s *followerReplication, req *AppendEntriesRPCRequest) {
 	// Mark any inflight logs as committed
-	if logs := req.entries; len(logs) > 0 {
+	if logs := req.Entries; len(logs) > 0 {
 		last := logs[len(logs)-1]
 		atomic.StoreUint64(&s.nextIndex, last.Index+1)
 		s.commitment.match(s.peer.ID, last.Index)
@@ -1567,9 +1565,9 @@ func updateLastAppended(s *followerReplication, req *AppendEntriesRPCRequest) {
 // 为每个日志追加请求设置前一个Index和Term，以及应该发送的日志.
 func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRPCRequest, nextIndex, lastIndex uint64) error {
 	//  设置当前的Index和Term，以及Leader当前的已提交Index
-	req.term = s.currentTerm
-	req.leaderId = string(r.leader)
-	req.leaderCommit = r.GetCommitIndex()
+	req.Term = s.currentTerm
+	req.LeaderId = string(r.leader)
+	req.LeaderCommit = r.GetCommitIndex()
 
 	// 设置前一个日志的Index和Term
 	err := r.setPreviousLog(req, nextIndex)
@@ -1589,8 +1587,8 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRPCR
 // Leader根据某个Follower的nextIndex设置应该发送给它的PrevIndex和PrevTerm
 func (r *Raft) setPreviousLog(req *AppendEntriesRPCRequest, nextIndex uint64) error {
 	if nextIndex == 1 {
-		req.prevLogIndex = 0
-		req.prevLogTerm = 0
+		req.PrevLogIndex = 0
+		req.PrevLogTerm = 0
 	} else {
 		var l raft.Log
 		err := r.logs.GetLog(nextIndex-1, &l)
@@ -1599,8 +1597,8 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRPCRequest, nextIndex uint64) er
 			return err
 		}
 
-		req.prevLogIndex = l.Index
-		req.prevLogTerm = l.Term
+		req.PrevLogIndex = l.Index
+		req.PrevLogTerm = l.Term
 	}
 
 	return nil
@@ -1608,7 +1606,7 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRPCRequest, nextIndex uint64) er
 
 // Leader从某个Follower的nextIndex开始直到lastIndex，查询应该发送给Follower的日志．
 func (r *Raft) setNewLogs(req *AppendEntriesRPCRequest, nextIndex, lastIndex uint64) error {
-	req.entries = make([]*raft.Log, 0, r.config.MaxAppendEntries)
+	req.Entries = make([]*raft.Log, 0, r.config.MaxAppendEntries)
 	maxIndex := min(nextIndex+uint64(r.config.MaxAppendEntries)-1, lastIndex)
 
 	for i := nextIndex; i <= maxIndex; i++ {
@@ -1620,7 +1618,7 @@ func (r *Raft) setNewLogs(req *AppendEntriesRPCRequest, nextIndex, lastIndex uin
 			return err
 		}
 
-		req.entries = append(req.entries, oldLog)
+		req.Entries = append(req.Entries, oldLog)
 	}
 
 	return nil

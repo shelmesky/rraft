@@ -32,6 +32,11 @@ func init() {
 func main() {
 	flag.Parse()
 
+	if nodeID == "" {
+		fmt.Fprintf(os.Stderr, "No Node ID specified\n")
+		os.Exit(1)
+	}
+
 	if flag.NArg() == 0 {
 		fmt.Fprintf(os.Stderr, "No Raft storage directory specified\n")
 		os.Exit(1)

@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	DefaultHTTPAddr = "0.0.0.0:11000"
-	DefaultRaftAddr = "0.0.0.0:11001"
+	DefaultHTTPAddr = "127.0.0.1:11000"
+	DefaultRaftAddr = "127.0.0.1:11001"
 )
 
 var (
